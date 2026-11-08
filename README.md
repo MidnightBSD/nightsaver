@@ -4,7 +4,7 @@ An OLED-friendly Xorg screensaver and PAM screen locker for MidnightBSD, written
 It is a drop-in replacement for the `xscreensaver` daemon and the `xscreensaver-command`
 control client.
 
-Status: **v0.3, Xorg only.** There is no Wayland support.
+Status: **v0.4, Xorg only.** There is no Wayland support.
 
 ## Features
 
@@ -49,6 +49,7 @@ Installed files:
 | Path (under `$PREFIX`)                  | Contents                         |
 |-----------------------------------------|----------------------------------|
 | `bin/nightsaver`, `bin/nightsaver-command` | daemon and client             |
+| `libexec/nightsaver-auth`               | PAM helper run per unlock attempt |
 | `man/man1`, `man/man5`                  | `nightsaver(1)`, `nightsaver-command(1)`, `nightsaver.toml(5)` |
 | `etc/nightsaver.toml.sample`            | annotated sample configuration   |
 | `share/applications/nightsaver*.desktop`| "Blank" and "Lock" launchers     |
@@ -159,6 +160,11 @@ Locking is off by default. Enable it with `lock = true`, `--lock`, or at any tim
 - Authentication uses OpenPAM. The default PAM service is `xscreensaver`; its policy
   (`/usr/local/etc/pam.d/xscreensaver`) runs the setuid helper `unix-selfauth-helper` through
   `pam_exec`, so nightsaver verifies your own password without any privilege and is not setuid.
+- PAM runs in a separate short-lived process, `libexec/nightsaver-auth` (not setuid either), started
+  by the daemon for each attempt with the password passed over a pipe. A PAM module that crashes or
+  hangs takes only the helper down: the daemon kills it after 25 s and counts anything but a clean
+  exit 0 as a denial, so the screen stays locked. The daemon looks for the helper next to its own
+  binary first (development builds), then in `$PREFIX/libexec` as compiled in by `make`.
 - `make install` (or `make install-pam`) installs `etc/pam.d/nightsaver` (a copy of the same policy) only if the file
   does not exist. It is used automatically when the `xscreensaver` policy is missing (for example
   after `mport delete xscreensaver`), or explicitly with `pam_service = "nightsaver"`.

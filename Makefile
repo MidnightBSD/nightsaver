@@ -26,12 +26,13 @@ ETCDIR=		$(PREFIX)/etc
 APPDIR=		$(PREFIX)/share/applications
 AUTOSTARTDIR=	$(PREFIX)/etc/xdg/autostart
 PAMDIR=		$(PREFIX)/etc/pam.d
+LIBEXECDIR=	$(PREFIX)/libexec
 
 all:
-	LOCALBASE="$(LOCALBASE)" $(CARGO) build --release
+	LOCALBASE="$(LOCALBASE)" PREFIX="$(PREFIX)" $(CARGO) build --release
 
 test:
-	LOCALBASE="$(LOCALBASE)" $(CARGO) test
+	LOCALBASE="$(LOCALBASE)" PREFIX="$(PREFIX)" $(CARGO) test
 
 clean:
 	$(CARGO) clean
@@ -40,6 +41,8 @@ install:
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -m 0755 target/release/nightsaver $(DESTDIR)$(BINDIR)/nightsaver
 	$(INSTALL) -m 0755 target/release/nightsaver-command $(DESTDIR)$(BINDIR)/nightsaver-command
+	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
+	$(INSTALL) -m 0755 target/release/nightsaver-auth $(DESTDIR)$(LIBEXECDIR)/nightsaver-auth
 	$(INSTALL) -d $(DESTDIR)$(MANDIR)/man1 $(DESTDIR)$(MANDIR)/man5
 	$(INSTALL) -m 0644 man/nightsaver.1 $(DESTDIR)$(MANDIR)/man1/nightsaver.1
 	$(INSTALL) -m 0644 man/nightsaver-command.1 $(DESTDIR)$(MANDIR)/man1/nightsaver-command.1
@@ -84,6 +87,7 @@ install-compat-links:
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/nightsaver $(DESTDIR)$(BINDIR)/nightsaver-command
+	rm -f $(DESTDIR)$(LIBEXECDIR)/nightsaver-auth
 	rm -f $(DESTDIR)$(MANDIR)/man1/nightsaver.1 $(DESTDIR)$(MANDIR)/man1/nightsaver-command.1
 	rm -f $(DESTDIR)$(MANDIR)/man5/nightsaver.toml.5
 	rm -f $(DESTDIR)$(ETCDIR)/nightsaver.toml.sample

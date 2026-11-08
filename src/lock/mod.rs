@@ -4,8 +4,11 @@
 //! wakes (at the latest at `next_deadline()`). The only path to `LockState::Unlocked` is an
 //! `Ok(())` received from the authentication worker thread *tagged with the current attempt's
 //! generation*; late results from abandoned (timed-out) attempts are discarded, and every
-//! error (including a dead worker or a timeout) is a denial. At most one PAM worker thread
-//! runs at a time, process-wide.
+//! error (including a dead worker or a timeout) is a denial. At most one authentication
+//! runs at a time, process-wide. Authentication itself happens in the `nightsaver-auth`
+//! helper process (`helper::authenticate`), so a crashing or hanging PAM module cannot take
+//! the locker down; the helper is killed after `helper::HELPER_TIMEOUT`.
+pub mod helper;
 pub mod pam;
 pub mod ui;
 
@@ -39,7 +42,7 @@ pub const TIMEOUT_TEXT: &str = "Auth timed out";
 /// Status text shown for PAM system errors (not a wrong password).
 pub const SYSTEM_ERROR_TEXT: &str = "Authentication failed";
 
-/// Pluggable authenticator: `(service, user, password)`. Defaults to `pam::authenticate`.
+/// Pluggable authenticator: `(service, user, password)`. Defaults to `helper::authenticate`.
 pub type AuthFn =
     Arc<dyn Fn(&str, &str, &Zeroizing<String>) -> Result<(), PamError> + Send + Sync>;
 
@@ -137,12 +140,12 @@ fn after(now: Instant, d: Duration) -> Instant {
 }
 
 impl Locker {
-    /// New locker in `LockState::Hidden`, authenticating with `pam::authenticate`.
+    /// New locker in `LockState::Hidden`, authenticating through the `nightsaver-auth` helper.
     /// All such lockers share one process-wide "PAM worker running" flag, so a hung worker
     /// from a replaced Locker still blocks new PAM transactions.
     pub fn new(user: String, service: String, passwd_timeout: Duration) -> Locker {
         static PAM_IN_FLIGHT: OnceLock<Arc<AtomicBool>> = OnceLock::new();
-        let mut l = Locker::with_auth(user, service, passwd_timeout, Arc::new(pam::authenticate));
+        let mut l = Locker::with_auth(user, service, passwd_timeout, Arc::new(helper::authenticate));
         l.in_flight = Arc::clone(PAM_IN_FLIGHT.get_or_init(|| Arc::new(AtomicBool::new(false))));
         l
     }

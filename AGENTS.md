@@ -19,13 +19,14 @@ Full design: `docs/PLAN.md`. Read it before touching code.
 
 ```
 src/bin/nightsaver.rs          daemon            src/bin/nightsaver-command.rs  control client
+src/bin/nightsaver-auth.rs     PAM helper process (one per unlock attempt; see src/lock/helper.rs)
 src/cli.rs                     xscreensaver-compatible flag parsing
 src/config/                    merged Config: CLI > ~/.config/nightsaver/config.toml > ~/.xscreensaver > defaults
 src/compat/protocol.rs         SCREENSAVER ClientMessage + _SCREENSAVER_* root/window properties
 src/x11/                       x11rb XCBConnection, monitors, saver windows, idle, grabs, present, keyboard
 src/render/                    Framebuffer (0x00RRGGBB), bitmap font, OLED post-pass
 src/patterns/                  trait Pattern + blank/clock/starfield/matrix/midnight/cat (+ assets/)
-src/lock/                      Locker state machine, PAM FFI, unlock dialog
+src/lock/                      Locker state machine, helper-process auth, PAM FFI, unlock dialog
 src/daemon.rs                  event loop: Idle -> Blanked -> Locked
 etc/ man/ tests/ Makefile      packaging, man pages, Xvfb smoke test
 ```
@@ -42,7 +43,9 @@ etc/ man/ tests/ Makefile      packaging, man pages, Xvfb smoke test
    - Never unmap, lower, or exit while `SaverState::Locked` except after a successful PAM result.
    - Never show the unlock dialog without a successful keyboard **and** pointer grab.
    - Password buffers are `zeroize::Zeroizing`; never log them or any key input.
-   - PAM/system errors are treated as "denied", never as "unlocked".
+   - PAM/system errors are treated as "denied", never as "unlocked". PAM runs only in the
+     `nightsaver-auth` helper process; the daemon never calls `pam_*` itself, and only the
+     helper's clean `exit(0)` unlocks (a signal, timeout or any other code is a denial).
    - `EXIT`/`RESTART`/`DEACTIVATE` commands and SIGTERM are ignored while locked **or while a lock
      is pending** (grab not yet acquired); a pending lock shows a visible "NOT LOCKED" notice.
    - Fail closed: an unknown user name, a PAM failure of any kind, or a hung authenticator all
@@ -56,7 +59,8 @@ etc/ man/ tests/ Makefile      packaging, man pages, Xvfb smoke test
    lit-pixel budget hint, avoid static pixels, and draw against pure black (0x000000).
 6. **Dependencies are fixed** in `Cargo.toml`. Do not add crates without asking; prefer std.
    No bindgen/libclang at build time.
-7. **Unsafe** is allowed only in `src/lock/pam.rs`, for thin libc calls (e.g. `localtime_r`) and where x11rb/xkbcommon require it; every
+7. **Unsafe** is allowed only in `src/lock/pam.rs`, for thin libc calls (e.g. `localtime_r`,
+   `setrlimit`) and where x11rb/xkbcommon require it; every
    `unsafe` block gets a `// SAFETY:` comment.
 8. `cargo build`, `cargo test`, and `cargo clippy --all-targets -- -D warnings` must pass before
    you report done. Run the narrowest check first, then the full set.
