@@ -4,7 +4,7 @@ An OLED-friendly Xorg screensaver and PAM screen locker for MidnightBSD, written
 It is a drop-in replacement for the `xscreensaver` daemon and the `xscreensaver-command`
 control client.
 
-Status: **v0.2, Xorg only.** There is no Wayland support.
+Status: **v0.3, Xorg only.** There is no Wayland support.
 
 ## Features
 
@@ -164,9 +164,19 @@ Locking is off by default. Enable it with `lock = true`, `--lock`, or at any tim
   after `mport delete xscreensaver`), or explicitly with `pam_service = "nightsaver"`.
 - Wrong passwords show an error for 2 s and add a delay of 1, 2, 4, 8, then 10 s per further failure.
   Escape or `passwd_timeout` (30 s) closes the dialog.
-- While locked, `-exit`, `-restart`, `SIGTERM` and `SIGINT` are refused (logged). Any PAM error counts
-  as a failed unlock. The dialog is never shown without a successful keyboard and pointer grab.
-  Password buffers are zeroed and never logged.
+- While locked, `-exit`, `-restart`, `SIGTERM` and `SIGINT` are refused (logged). The same applies while
+  a lock is *pending*: if another program holds the keyboard or mouse grab when a lock is due, the
+  screen stays blanked with a visible "NOT LOCKED" notice until the grab succeeds, and `-deactivate`
+  does not cancel it. Any PAM error counts as a failed unlock. The dialog is never shown without a
+  successful keyboard and pointer grab. Password buffers are zeroed and never logged.
+- If the user name cannot be looked up, the screen still locks and every attempt is denied (fail closed).
+- Configuration files (`~/.xscreensaver`, the TOML file) are ignored with an error if they are not
+  regular files owned by you or root, or if they are writable by group or others, since they choose the
+  PAM service. `pam_service` may not contain `/`. A log file is opened without following symlinks and must
+  be owned by you and not writable by others.
+- Events another client sends with `XSendEvent` are ignored except for the control protocol, and
+  RANDR monitors that lie inside another or whose total area exceeds twice the root are collapsed, so
+  a hostile client cannot hide the dialog or force huge allocations.
 
 Security caveats shared with xscreensaver: an X11 locker cannot stop the X server being killed
 (for example Ctrl-Alt-Backspace where enabled), switching to a text VT with a logged-in session

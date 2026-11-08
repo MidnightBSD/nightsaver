@@ -14,6 +14,15 @@ impl Framebuffer {
     pub fn new(width: u32, height: u32) -> Self {
         Framebuffer { width, height, pixels: vec![0; (width as usize) * (height as usize)] }
     }
+    /// Like `new`, but an allocation failure is an error instead of an abort (the locked
+    /// daemon must survive hostile monitor geometry).
+    pub fn try_new(width: u32, height: u32) -> Result<Self, std::collections::TryReserveError> {
+        let n = (width as usize) * (height as usize);
+        let mut pixels = Vec::new();
+        pixels.try_reserve_exact(n)?;
+        pixels.resize(n, 0);
+        Ok(Framebuffer { width, height, pixels })
+    }
     pub fn clear(&mut self) {
         self.pixels.fill(0);
     }

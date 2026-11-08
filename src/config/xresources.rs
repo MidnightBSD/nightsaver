@@ -227,6 +227,9 @@ pub fn default_path() -> Option<PathBuf> {
 /// Read `$HOME/.xscreensaver`; `Ok(None)` if `$HOME` is unset or the file does not exist.
 pub fn load_default() -> Result<Option<XResources>, ConfigError> {
     let Some(p) = default_path() else { return Ok(None) };
+    if let Some(why) = super::untrusted_file(&p) {
+        return Err(ConfigError::Parse(format!("{}: {why}", p.display())));
+    }
     match std::fs::read_to_string(&p) {
         Ok(s) => parse_str(&s).map(Some),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),

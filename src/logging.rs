@@ -6,7 +6,7 @@
 use log::{LevelFilter, Log, Metadata, Record};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -67,14 +67,7 @@ impl Log for Logger {
 /// cannot be opened.
 pub fn init(verbose: u8, log_file: Option<&Path>) -> Result<(), String> {
     let file = match log_file {
-        Some(p) => Some(
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .mode(0o600)
-                .open(p)
-                .map_err(|e| format!("cannot open log file {}: {e}", p.display()))?,
-        ),
+        Some(p) => Some(open_log_file(p)?),
         None => None,
     };
     let level = level_for(verbose, file.is_some());
@@ -85,6 +78,32 @@ pub fn init(verbose: u8, log_file: Option<&Path>) -> Result<(), String> {
     log::set_logger(logger).map_err(|e| format!("logger already initialised: {e}"))?;
     log::set_max_level(level);
     Ok(())
+}
+
+/// Open (or create, mode 0600) the log file without following a symlink, and refuse a file
+/// that is not a regular file owned by us or that others could write: a pre-created link or
+/// world-writable file in a shared directory must not redirect or expose the log.
+fn open_log_file(p: &Path) -> Result<File, String> {
+    let f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(p)
+        .map_err(|e| format!("cannot open log file {}: {e}", p.display()))?;
+    let md = f.metadata().map_err(|e| format!("cannot stat log file {}: {e}", p.display()))?;
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let me = unsafe { libc::getuid() };
+    if !md.is_file() {
+        return Err(format!("log file {} is not a regular file", p.display()));
+    }
+    if md.uid() != me {
+        return Err(format!("log file {} is owned by uid {}, not us", p.display(), md.uid()));
+    }
+    if md.mode() & 0o022 != 0 {
+        return Err(format!("log file {} is writable by group or others", p.display()));
+    }
+    Ok(f)
 }
 
 #[cfg(test)]

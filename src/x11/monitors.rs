@@ -116,6 +116,49 @@ pub fn sanitize(raw: Vec<Monitor>, root_w: u16, root_h: u16) -> Vec<Monitor> {
     if capped {
         log::warn!("more than {MAX_MONITORS} distinct monitors reported; using the first {MAX_MONITORS}");
     }
+    // Drop monitors fully contained in another (xscreensaver does the same): they would only
+    // duplicate framebuffers, and a tiny "primary" could otherwise capture the dialog.
+    let area = |m: &Monitor| i64::from(m.width) * i64::from(m.height);
+    let contains = |a: &Monitor, b: &Monitor| {
+        let (ax0, ay0) = (i32::from(a.x), i32::from(a.y));
+        let (bx0, by0) = (i32::from(b.x), i32::from(b.y));
+        bx0 >= ax0
+            && by0 >= ay0
+            && bx0 + i32::from(b.width) <= ax0 + i32::from(a.width)
+            && by0 + i32::from(b.height) <= ay0 + i32::from(a.height)
+    };
+    let mut kept: Vec<Monitor> = Vec::with_capacity(out.len());
+    let mut dropped_primary: Vec<Monitor> = Vec::new();
+    for (i, m) in out.iter().enumerate() {
+        // Identical rectangles were merged above, so a strictly larger (or earlier, if equal
+        // area) container is unambiguous.
+        let inside = out
+            .iter()
+            .enumerate()
+            .any(|(j, o)| j != i && contains(o, m) && (area(o) > area(m) || j < i));
+        if inside {
+            log::debug!("dropping monitor {m:?}: contained in another");
+            if m.primary {
+                dropped_primary.push(*m);
+            }
+            continue;
+        }
+        kept.push(*m);
+    }
+    for d in dropped_primary {
+        if let Some(k) = kept.iter_mut().find(|k| contains(k, &d)) {
+            k.primary = true;
+        }
+    }
+    out = kept;
+    // Bound the total framebuffer area: overlapping client-defined monitors could otherwise
+    // multiply allocations until the process aborts, which would drop the lock.
+    let root_area = i64::from(root_w.max(1)) * i64::from(root_h.max(1));
+    let total: i64 = out.iter().map(area).sum();
+    if total > root_area.saturating_mul(2) {
+        log::warn!("monitors cover {total} px, more than twice the root ({root_area} px); using the root");
+        out.clear();
+    }
     if out.is_empty() {
         out.push(Monitor { x: 0, y: 0, width: root_w.max(1), height: root_h.max(1), primary: true });
     }
@@ -195,9 +238,8 @@ mod tests {
         // Two rectangles that become identical after clipping, plus an overlapping one.
         let raw = vec![m(0, 0, 1280, 800), p, m(0, 0, 5000, 5000), m(100, 100, 640, 480)];
         let out = sanitize(raw, 1280, 800);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0], p, "primary flag merged into first occurrence");
-        assert_eq!(out[1], m(100, 100, 640, 480));
+        // The overlapping one lies inside the root-sized monitor and is dropped.
+        assert_eq!(out, vec![p], "primary flag merged into first occurrence");
     }
 
     #[test]
@@ -216,5 +258,29 @@ mod tests {
         assert_eq!(sanitize(vec![m(0, 0, 0, 0)], 1280, 800), vec![root()]);
         // Degenerate root still yields a non-empty, non-zero rectangle.
         assert_eq!(sanitize(Vec::new(), 0, 0)[0].width, 1);
+    }
+
+    #[test]
+    fn contained_monitors_are_dropped_and_primary_propagates() {
+        let mut tiny = m(10, 10, 4, 4);
+        tiny.primary = true;
+        let out = sanitize(vec![m(0, 0, 1280, 800), tiny, m(100, 100, 200, 200)], 1280, 800);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].width, out[0].height), (1280, 800));
+        assert!(out[0].primary, "primary flag moves to the containing monitor");
+    }
+
+    #[test]
+    fn overlapping_but_not_contained_survive() {
+        let out = sanitize(vec![m(0, 0, 1000, 800), m(500, 0, 780, 800)], 1280, 800);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn excessive_total_area_falls_back_to_root() {
+        // Sixteen near-root monitors each offset by one pixel: none contains another.
+        let raw: Vec<Monitor> = (0..16).map(|i| m(i, 0, 1264, 800)).collect();
+        let out = sanitize(raw, 1280, 800);
+        assert_eq!(out, vec![root()]);
     }
 }

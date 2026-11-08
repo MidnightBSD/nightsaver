@@ -122,13 +122,16 @@ impl Config {
     /// Load defaults, overlay ~/.xscreensaver, overlay nightsaver toml, overlay CLI.
     pub fn load(cli: &crate::cli::Args) -> Result<Config, ConfigError> {
         let xres = xresources::load_default()?;
-        let toml_path = cli.config_path.clone().unwrap_or_else(toml::default_path);
-        let t = toml::load(&toml_path)?;
+        let toml_path = cli.config_path.clone().or_else(toml::default_path);
+        let t = match &toml_path {
+            Some(p) => toml::load(p)?,
+            None => None,
+        };
         // An explicitly requested config file must exist.
-        if t.is_none() && cli.config_path.is_some() {
+        if t.is_none() && let Some(p) = &cli.config_path {
             return Err(ConfigError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("config file {} not found", toml_path.display()),
+                format!("config file {} not found", p.display()),
             )));
         }
         Ok(Config::load_from(cli, xres, t))
@@ -276,6 +279,14 @@ impl Config {
             self.patterns = Config::default().patterns;
         }
         self.selected = self.selected.min(self.patterns.len() - 1);
+        // `clamp` keeps NaN; a non-finite value falls back to the default.
+        let dflt = Config::default().oled;
+        if !self.oled.max_brightness.is_finite() {
+            self.oled.max_brightness = dflt.max_brightness;
+        }
+        if !self.oled.lit_budget.is_finite() {
+            self.oled.lit_budget = dflt.lit_budget;
+        }
         self.oled.max_brightness = self.oled.max_brightness.clamp(0.0, 1.0);
         self.oled.lit_budget = self.oled.lit_budget.clamp(0.0, 1.0);
         self.fps = self.fps.clamp(1, 120);
@@ -303,7 +314,9 @@ impl Config {
         if let Some(p) = xresources::default_path() {
             v.push(p);
         }
-        v.push(self.config_path.clone().unwrap_or_else(toml::default_path));
+        if let Some(p) = self.config_path.clone().or_else(toml::default_path) {
+            v.push(p);
+        }
         v
     }
 }
@@ -322,12 +335,37 @@ fn pam_policy_dirs() -> Vec<PathBuf> {
 pub fn resolve_pam_service(service: &str, dirs: &[PathBuf]) -> String {
     const DEFAULT: &str = "xscreensaver";
     const FALLBACK: &str = "nightsaver";
+    // OpenPAM treats a service name containing '/' as a path to a policy file, which would
+    // let a config file point authentication at an arbitrary (e.g. pam_permit) policy.
+    if service.is_empty() || service.contains('/') || service.contains("..") {
+        log::error!("invalid pam_service {service:?}: using {DEFAULT:?}");
+        return resolve_pam_service(DEFAULT, dirs);
+    }
     let exists = |name: &str| dirs.iter().any(|d| d.join(name).exists());
     if service == DEFAULT && !exists(DEFAULT) && exists(FALLBACK) {
         log::info!("PAM policy for '{DEFAULT}' not found; using '{FALLBACK}'");
         FALLBACK.to_string()
     } else {
         service.to_string()
+    }
+}
+
+/// Reason a configuration file must not be trusted, or `None` if it is fine (or absent).
+/// Config can select the PAM service and disable locking, so it must be a regular file owned
+/// by us (or root) and not writable by group or others.
+pub(crate) fn untrusted_file(path: &std::path::Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(path).ok()?;
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let me = unsafe { libc::getuid() };
+    if !md.is_file() {
+        Some("not a regular file; ignored".into())
+    } else if md.uid() != me && md.uid() != 0 {
+        Some(format!("owned by uid {}, not by us; ignored", md.uid()))
+    } else if md.mode() & 0o022 != 0 {
+        Some("writable by group or others; ignored".into())
+    } else {
+        None
     }
 }
 
@@ -350,6 +388,44 @@ impl std::error::Error for ConfigError {}
 #[cfg(test)]
 mod tests {
     use super::xresources::{Program, XMode, XResources};
+
+    #[test]
+    fn pam_service_with_path_characters_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("nightsaver-pam2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("xscreensaver"), "").unwrap();
+        let dirs = vec![dir.clone()];
+        assert_eq!(resolve_pam_service("/etc/pam.d/permissive", &dirs), "xscreensaver");
+        assert_eq!(resolve_pam_service("../evil", &dirs), "xscreensaver");
+        assert_eq!(resolve_pam_service("", &dirs), "xscreensaver");
+        assert_eq!(resolve_pam_service("login", &dirs), "login");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_finite_oled_values_use_defaults() {
+        let t = toml::parse_str("[oled]\nmax_brightness = nan\nlit_budget = inf\n").unwrap();
+        let c = Config::load_from(&Args::default(), None, Some(t));
+        let d = Config::default();
+        assert_eq!(c.oled.max_brightness, d.oled.max_brightness);
+        assert_eq!(c.oled.lit_budget, d.oled.lit_budget);
+    }
+
+    #[test]
+    fn group_or_world_writable_config_is_untrusted() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("nightsaver-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.toml");
+        std::fs::write(&p, "lock = false\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(untrusted_file(&p).is_none());
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(untrusted_file(&p).is_some());
+        assert!(toml::load(&p).is_err(), "writable config must be refused, not applied");
+        assert!(untrusted_file(&dir.join("missing")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn pam_service_falls_back_to_nightsaver_only_when_default_policy_missing() {
