@@ -4,7 +4,7 @@ An OLED-friendly Xorg screensaver and PAM screen locker for MidnightBSD, written
 It is a drop-in replacement for the `xscreensaver` daemon and the `xscreensaver-command`
 control client.
 
-Status: **v0.4, Xorg only.** There is no Wayland support.
+Status: **v0.5, Xorg only.** There is no Wayland support.
 
 ## Features
 
@@ -89,7 +89,7 @@ timeout = "0:05:00"        # idle time before blanking
 lock = true                # require a password
 lock_timeout = "0:00:30"   # lock this long after blanking
 mode = "random"            # one | random | blank | off
-patterns = ["clock", "starfield", "matrix", "midnight", "cat"]
+patterns = ["clock", "starfield", "matrix", "midnight", "cat", "juggler"]
 
 [dpms]
 enabled = true
@@ -138,9 +138,10 @@ reachable, 1 for usage errors. `-demo` is parsed but answered with "not supporte
 | `matrix`    | Falling character rain (aliases `glmatrix`, `xmatrix`).      |
 | `midnight`  | The MidnightBSD logo as a drifting outline with twinkling fill, and the boot loader's ASCII brand (aliases `midnightbsd`, `logo`). |
 | `cat`       | An ASCII-art cat that blinks, swishes its tail, naps with floating z's and watches the odd mouse go by (aliases `asciicat`, `kitty`). |
+| `juggler`   | An ASCII-art stick figure juggling a three-ball cascade on smooth arcs (alias `juggle`). |
 
 `-select N` and `-next`/`-prev` index the configured `patterns` list. The default list is
-`clock`, `starfield`, `matrix`, `midnight`, `cat`; `blank` is available by name or via `mode = "blank"`.
+`clock`, `starfield`, `matrix`, `midnight`, `cat`, `juggler`; `blank` is available by name or via `mode = "blank"`.
 
 ## OLED design notes
 
