@@ -48,35 +48,72 @@ impl Pattern for Starfield {
         self.height = height;
         self.t = 0.0;
         self.rmax = (width as f32).hypot(height as f32).max(1.0);
-        // Stars cover up to 4 px (2x2) when close; keep total area within 30% of the budget.
-        let n = ((lit_budget_pixels(width, height, lit_budget) as f32 * 0.3 / 4.0) as usize).min(MAX_STARS);
+        // A close star is a streak of up to ~3x16 px; keep the total area within 60% of the budget.
+        let n = ((lit_budget_pixels(width, height, lit_budget) as f32 * 0.6 / 48.0) as usize).min(MAX_STARS);
         self.stars = (0..n).map(|_| self.spawn(rng, true)).collect();
     }
     fn step(&mut self, dt: Duration, fb: &mut Framebuffer, rng: &mut Rng) {
-        let dts = dt.as_secs_f32();
+        let dts = dt.as_secs_f32().min(0.1);
         self.t += dts;
         let (vx, vy) = self.vanishing_point();
         let (w, h) = (fb.width as f32, fb.height as f32);
         for i in 0..self.stars.len() {
             let mut s = self.stars[i];
-            s.r += dts * s.speed * (self.rmax * 0.02 + s.r * 0.25);
-            let x = vx + s.angle.cos() * s.r;
-            let y = vy + s.angle.sin() * s.r;
+            let r0 = s.r;
+            s.r += dts * s.speed * (self.rmax * 0.03 + s.r * 0.35);
+            let (ca, sa) = (s.angle.cos(), s.angle.sin());
+            let x = vx + ca * s.r;
+            let y = vy + sa * s.r;
             if x < 0.0 || y < 0.0 || x >= w || y >= h {
                 self.stars[i] = self.spawn(rng, false);
                 continue;
             }
             self.stars[i] = s;
-            // Depth: farther (near the vanishing point) is dimmer and smaller.
-            let d = (s.r / (self.rmax * 0.5)).clamp(0.0, 1.0);
-            let col = scale(rgb(255, 255, 255), 0.2 + 0.8 * d);
-            let size = if d > 0.55 { 2 } else { 1 };
-            fb.fill_rect(x as i32, y as i32, size, size, col);
+            // Depth: farther (near the vanishing point) is dimmer, smaller and slower.
+            let d = (s.r / (self.rmax * 0.45)).clamp(0.0, 1.0);
+            let bright = 0.45 + 0.55 * d;
+            let head = scale(rgb(235, 240, 255), bright);
+            let tail = scale(rgb(150, 170, 255), bright * 0.4);
+            let size = if d > 0.7 {
+                3
+            } else if d > 0.3 {
+                2
+            } else {
+                1
+            };
+            // Streak from the previous position, lengthened with depth for a warp feel.
+            let trail = (s.r - r0) * (1.0 + 3.0 * d) + 1.5 * d;
+            let tr = (s.r - trail).max(0.0);
+            let (tx, ty) = (vx + ca * tr, vy + sa * tr);
+            streak(fb, (tx, ty), (x, y), size, (tail, head));
         }
     }
     fn wants_fps(&self) -> u32 {
         30
     }
+}
+
+/// Draw a short line from `from` to `to`, fading between `colors.0` and `colors.1`, `size` px thick.
+fn streak(fb: &mut Framebuffer, from: (f32, f32), to: (f32, f32), size: u32, colors: (u32, u32)) {
+    let ((x0, y0), (x1, y1)) = (from, to);
+    let (dx, dy) = (x1 - x0, y1 - y0);
+    let steps = dx.abs().max(dy.abs()).ceil().clamp(1.0, 64.0);
+    let n = steps as u32;
+    let half = (size / 2) as f32;
+    for k in 0..=n {
+        let f = k as f32 / steps;
+        let (x, y) = (x0 + dx * f - half, y0 + dy * f - half);
+        let col = lerp(colors.0, colors.1, f);
+        fb.fill_rect(x.round() as i32, y.round() as i32, size, size, col);
+    }
+}
+
+fn lerp(a: u32, b: u32, f: f32) -> u32 {
+    let ch = |sh: u32| {
+        let (ca, cb) = (((a >> sh) & 0xff) as f32, ((b >> sh) & 0xff) as f32);
+        ((ca + (cb - ca) * f).round().clamp(0.0, 255.0) as u32) << sh
+    };
+    ch(16) | ch(8) | ch(0)
 }
 
 #[cfg(test)]
