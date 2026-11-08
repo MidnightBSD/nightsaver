@@ -1,0 +1,57 @@
+# XScreenSaver Preferences File
+# Written by xscreensaver-settings 6.15, 14-Oct-2026 09:12:44 PM.
+# https://www.jwz.org/xscreensaver/
+
+timeout:	0:05:00
+cycle:		0:10:00
+lock:		False
+lockTimeout:	0:00:00
+passwdTimeout:	0:00:30
+dpmsEnabled:	True
+dpmsQuickoffEnabled:	False
+dpmsStandby:	2:00:00
+dpmsSuspend:	2:00:00
+dpmsOff:	4:00:00
+grabDesktopImages:	True
+grabVideoFrames:	False
+chooseRandomImages:	False
+imageDirectory:	
+mode:		random
+selected:	-1
+
+textMode:	date
+textLiteral:	XScreenSaver
+textFile:	
+textProgram:	fortune
+textURL:	https://en.wikipedia.org/w/index.php?title=Special:NewPages&feed=rss
+
+fade:		True
+unfade:		False
+fadeSeconds:	0:00:03
+fadeTicks:	20
+splash:		False
+splashDuration:	0:00:05
+visualID:	default
+installColormap:	True
+verbose:	False
+ignoreUninstalledPrograms:	True
+nice:		10
+
+programs:								      \
+				maze -root				    \n\
+- 				xsnow -bg SkyBlue3 -solidbg		    \n\
+				attraction -root			    \n\
+				blitspin -root				    \n\
+  GL: 				superquadrics -root			    \n\
+				greynetic -root				    \n\
+  GL:				matrix -root				    \n\
+-				xearth -nofork -ncolors 50 -night 3	      \
+				  -pos sunrel/38/-30 -wait 0		    \n\
+				clock -root				    \n\
+				starfield -root				    \n\
+				"Phosphor"	phosphor -root				    \n\
+
+pointerPollTime:	0:00:05
+pointerHysteresis:	10
+windowCreationTimeout:	0:00:30
+initialDelay:	0:00:00

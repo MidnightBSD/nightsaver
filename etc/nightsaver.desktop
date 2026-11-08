@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Nightsaver Blank
+Comment=Blank the screen with nightsaver
+Exec=nightsaver-command -activate
+Icon=preferences-desktop-screensaver
+Categories=Settings;DesktopSettings;Security;
+Terminal=false
+StartupNotify=false

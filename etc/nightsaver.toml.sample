@@ -1,0 +1,75 @@
+# nightsaver configuration. Install as ~/.config/nightsaver/config.toml
+# (or $XDG_CONFIG_HOME/nightsaver/config.toml, or pass --config <file>).
+#
+# Precedence: command line > this file > ~/.xscreensaver > built-in defaults.
+# Every key is optional; the commented values below are the built-in defaults.
+#
+# Durations accept integer seconds (300) or strings: "300", "5:00" (MM:SS), "0:05:00" (H:MM:SS).
+
+# X display to manage (default: $DISPLAY).
+# display = ":0"
+
+# Log verbosity: 0 = warnings, 1 = info, 2 = debug, 3+ = trace.
+# verbose = 0
+
+# Also append log lines to this file (implies at least verbose = 1).
+# log_file = "/home/you/.nightsaver.log"
+
+# Show a startup splash (accepted for compatibility; nightsaver has none).
+# splash = false
+
+# Idle time before blanking.
+# timeout = "0:10:00"
+
+# Time between pattern changes.
+# cycle = "0:10:00"
+
+# Lock the screen (PAM password required) when blanking.
+# lock = false
+
+# Time after blanking before the screen becomes locked.
+# lock_timeout = "0:00:00"
+
+# How long the unlock dialog stays up without input.
+# passwd_timeout = "0:00:30"
+
+# PAM service name used to authenticate. If the default "xscreensaver" policy does not
+# exist but /usr/local/etc/pam.d/nightsaver does (make install-pam), that one is used.
+# pam_service = "xscreensaver"
+
+# Pattern selection: "one" (only patterns[selected]), "random", "blank" (pure black), "off" (never activate).
+# mode = "random"
+
+# Pattern names: blank, clock, starfield, matrix.
+# patterns = ["clock", "starfield", "matrix"]
+
+# 0-based index into patterns, used when mode = "one".
+# selected = 0
+
+# Frame rate for animated patterns.
+# fps = 30
+
+# Pointer movement (pixels, cumulative) that wakes an unlocked screen.
+# motion_threshold_px = 10
+
+[dpms]
+# Manage monitor power saving after blanking.
+# enabled = false
+# standby = "2:00:00"
+# suspend = "2:00:00"
+# off = "4:00:00"
+# Power the monitor off immediately when blanking.
+# quick_off = false
+
+[oled]
+# Luma cap (0.0 - 1.0) applied to every frame.
+# max_brightness = 0.35
+# Interval between slow whole-frame position shifts (burn-in protection).
+# shift_interval = "0:01:00"
+# Maximum shift distance in pixels.
+# shift_max_px = 16
+# Periodic full-black rest: how often and for how long.
+# rest_interval = "0:10:00"
+# rest_duration = "0:00:20"
+# Target fraction of lit pixels (0.0 - 1.0), a hint to patterns.
+# lit_budget = 0.05

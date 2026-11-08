@@ -1,0 +1,39 @@
+[package]
+name = "nightsaver"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "BSD-2-Clause"
+description = "OLED-friendly Xorg screensaver and PAM screen locker, xscreensaver drop-in"
+repository = "https://github.com/laffer1/nightsaver"
+
+build = "build.rs"
+
+[lib]
+name = "nightsaver"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nightsaver"
+path = "src/bin/nightsaver.rs"
+
+[[bin]]
+name = "nightsaver-command"
+path = "src/bin/nightsaver-command.rs"
+
+[dependencies]
+x11rb = { version = "0.14", features = ["allow-unsafe-code", "image", "screensaver", "xinput", "xkb", "randr", "dpms", "shm", "xfixes"] }
+xkbcommon = { version = "0.9", default-features = false, features = ["x11"] }
+libpam-sys = "0.2"
+nix = { version = "0.31", features = ["user", "signal"] }
+libc = "0.2"
+clap = { version = "4.6", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1.2"
+zeroize = "1"
+log = { version = "0.4", features = ["std"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

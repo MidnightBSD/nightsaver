@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Nightsaver Lock
+Comment=Lock the screen with nightsaver
+Exec=nightsaver-command -lock
+Icon=system-lock-screen
+Categories=Settings;DesktopSettings;Security;
+Terminal=false
+StartupNotify=false

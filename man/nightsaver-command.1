@@ -1,0 +1,137 @@
+.Dd November 8, 2026
+.Dt NIGHTSAVER-COMMAND 1
+.Os
+.Sh NAME
+.Nm nightsaver-command
+.Nd control a running nightsaver or xscreensaver daemon
+.Sh SYNOPSIS
+.Nm
+.Op Fl display Ar host:display.screen
+.Op Fl quiet | Fl verbose
+.Fl activate | deactivate | cycle | next | prev | lock | suspend | exit | restart | time | watch | version
+.Nm
+.Op Fl display Ar host:display.screen
+.Op Fl quiet | Fl verbose
+.Fl select Ar N
+.Sh DESCRIPTION
+.Nm
+sends commands to a running
+.Xr nightsaver 1
+daemon, and also to an
+.Xr xscreensaver 1
+daemon, using the xscreensaver control protocol.
+Its options and messages follow
+.Xr xscreensaver-command 1 .
+Options may be given with one or two dashes and may be abbreviated to any
+unambiguous prefix.
+Exactly one command is accepted.
+.Pp
+The daemon is found through the
+.Dq _SCREENSAVER_VERSION
+property on the root window of the display, and the reply is read back through
+.Dq _SCREENSAVER_RESPONSE .
+.Pp
+The options are:
+.Bl -tag -width indent
+.It Fl display Ar dpy
+The X display to talk to.
+The default is
+.Ev DISPLAY .
+.It Fl quiet
+Print output only if an error occurs.
+.It Fl verbose
+The opposite of
+.Fl quiet .
+This is the default.
+.It Fl activate
+Blank the screen now, as if the user had been idle.
+Fails if the screen is already blanked.
+.It Fl deactivate
+Unblank the screen, as if there had been user activity.
+If the screen is locked, it is not unlocked: the unlock dialog is shown.
+When the screen is not blanked the idle timer is reset.
+.It Fl cycle
+If the screen is blanked, switch to another pattern.
+Fails if the screen is not blanked.
+.It Fl next
+Like
+.Fl activate
+or
+.Fl cycle ,
+but run the next pattern in the list.
+.It Fl prev
+Like
+.Fl next ,
+in the other direction.
+.It Fl select Ar N
+Like
+.Fl activate ,
+but run pattern number
+.Ar N
+of the configured pattern list (1-based).
+Fails if there is no such pattern.
+.It Fl lock
+Lock the screen now, blanking it first if necessary.
+Fails if the screen is already locked.
+Works even when locking is not enabled in the configuration.
+.It Fl suspend
+Like
+.Fl activate ,
+but power the monitor off immediately (DPMS).
+.It Fl exit
+Make the daemon exit.
+Refused while the screen is locked.
+Succeeds silently if no daemon is running.
+.It Fl restart
+Make the daemon re-execute itself.
+Refused while the screen is locked.
+.It Fl time
+Print the version line and when the screen was last blanked or unblanked.
+.It Fl watch
+Print a line each time the saver state changes.
+This command never returns.
+.It Fl version
+Print the name and version of the running daemon.
+.It Fl help
+Print a usage summary.
+.El
+.Pp
+The
+.Xr xscreensaver-command 1
+option
+.Fl demo
+is parsed but the daemon answers that it is not supported.
+.Sh ENVIRONMENT
+.Bl -tag -width DISPLAY
+.It Ev DISPLAY
+The default display.
+.El
+.Sh EXIT STATUS
+.Bl -tag -width indent
+.It 0
+The command was accepted by the daemon, or
+.Fl exit
+was given and no daemon is running.
+.It 1
+A usage error, or the display could not be opened.
+.It 255
+The daemon refused the command (for example
+.Fl activate
+when already blanked,
+.Fl exit
+while locked), no daemon is running, there was no or an unrecognised
+response, or the status property is missing or malformed.
+.El
+.Sh EXAMPLES
+Blank the screen, then lock it:
+.Bd -literal -offset indent
+nightsaver-command -activate
+nightsaver-command -lock
+.Ed
+.Sh SEE ALSO
+.Xr nightsaver 1 ,
+.Xr xscreensaver 1 ,
+.Xr xscreensaver-command 1 ,
+.Xr nightsaver.toml 5
+.Sh AUTHORS
+.An Lucas Holt

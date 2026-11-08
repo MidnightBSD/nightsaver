@@ -1,0 +1,303 @@
+.Dd November 8, 2026
+.Dt NIGHTSAVER.TOML 5
+.Os
+.Sh NAME
+.Nm nightsaver.toml
+.Nd nightsaver configuration file
+.Sh DESCRIPTION
+The
+.Xr nightsaver 1
+daemon reads its configuration from a TOML file.
+The default location is
+.Pa $XDG_CONFIG_HOME/nightsaver/config.toml ,
+or
+.Pa ~/.config/nightsaver/config.toml
+if
+.Ev XDG_CONFIG_HOME
+is unset or empty.
+Another file may be named with
+.Fl Fl config ;
+that file must exist.
+A missing default file is not an error.
+An annotated sample is installed as
+.Pa /usr/local/etc/nightsaver.toml.sample .
+.Pp
+Every key is optional.
+Keys at the top level are given first, followed by the
+.Sy [dpms]
+and
+.Sy [oled]
+tables.
+.Ss Precedence
+Each setting is taken from the first of these that provides it:
+.Bl -enum -compact
+.It
+the command line,
+.It
+this file,
+.It
+the user's
+.Pa ~/.xscreensaver ,
+.It
+the built-in default.
+.El
+.Pp
+The files are checked for changes every five seconds and reloaded on
+.Dv SIGHUP .
+If the new contents cannot be parsed, the old settings are kept.
+Unknown keys are ignored by the TOML parser; an invalid value or an invalid
+.Va mode
+rejects the whole file.
+.Ss Durations
+Keys of type
+.Em duration
+accept an integer number of seconds
+.Pq Li 300
+or a string:
+.Li "300" ,
+.Li "5:00"
+(minutes:seconds) or
+.Li "0:05:00"
+(hours:minutes:seconds).
+Negative values are rejected.
+.Sh KEYS
+.Bl -tag -width indent
+.It Va display No (string, default Dv $DISPLAY )
+X display to manage.
+.It Va verbose No (integer, default 0)
+Log verbosity: 0 warnings, 1 info, 2 debug, 3 and above trace.
+.It Va log_file No (string, default none)
+Also append log lines to this file.
+.It Va splash No (boolean, default false)
+Accepted for compatibility; nightsaver has no splash screen.
+.It Va timeout No (duration, default 0:10:00)
+Idle time before the screen is blanked.
+.It Va cycle No (duration, default 0:10:00)
+Time between pattern changes.
+.It Va lock No (boolean, default false)
+Lock the screen when it is blanked.
+.It Va lock_timeout No (duration, default 0:00:00)
+Time after blanking before the screen becomes locked.
+.It Va passwd_timeout No (duration, default 0:00:30)
+How long the unlock dialog stays up without input.
+.It Va pam_service No (string, default Qq xscreensaver )
+PAM service name used to authenticate.
+If the default policy does not exist in
+.Pa /etc/pam.d
+or
+.Pa /usr/local/etc/pam.d
+but a
+.Qq nightsaver
+policy does (installed by
+.Ql make install-pam ) ,
+that one is used automatically.
+Any other name is used as given.
+.It Va mode No (string, default Qq random )
+Pattern selection:
+.Qq one
+shows only the pattern at index
+.Va selected ;
+.Qq random
+changes between the patterns in
+.Va patterns ;
+.Qq random-same
+is accepted and treated as
+.Qq random ;
+.Qq blank
+shows pure black;
+.Qq off
+never activates.
+Any other value is an error.
+.It Va patterns No (array of strings, default Qq clock , Qq starfield , Qq matrix )
+The pattern list.
+An empty array is ignored.
+Names are:
+.Bl -tag -width starfield -compact
+.It blank
+Pure black.
+.It clock
+A time display that drifts slowly around the screen.
+.It starfield
+Stars flying outward.
+.It matrix
+Falling character rain.
+.El
+.Pp
+Also accepted as aliases:
+.Qq stars ,
+.Qq glmatrix
+and
+.Qq xmatrix .
+.It Va selected No (integer, default 0)
+Zero-based index into
+.Va patterns ,
+used when
+.Va mode
+is
+.Qq one .
+Clamped to the list.
+.It Va fps No (integer, default 30)
+Frame rate of animated patterns, limited to 1..120.
+.It Va motion_threshold_px No (integer, default 10)
+Cumulative pointer movement, in pixels, that wakes a blanked, unlocked screen.
+.El
+.Ss The [dpms] table
+.Bl -tag -width indent
+.It Va enabled No (boolean, default false)
+Manage monitor power saving while blanked.
+.It Va standby No (duration, default 2:00:00)
+.It Va suspend No (duration, default 2:00:00)
+.It Va off No (duration, default 4:00:00)
+DPMS timeouts installed while the screen is blanked.
+The server's previous settings are restored on unblanking.
+.It Va quick_off No (boolean, default false)
+Power the monitor off immediately when blanking.
+.El
+.Ss The [oled] table
+.Bl -tag -width indent
+.It Va max_brightness No (float, default 0.35)
+Luma cap from 0.0 to 1.0 applied to every frame of every pattern.
+The blank pattern is true black regardless.
+.It Va shift_interval No (duration, default 0:01:00)
+How often the whole frame is moved to a new position.
+.It Va shift_max_px No (integer, default 16)
+Maximum shift in pixels from the original position.
+.It Va rest_interval No (duration, default 0:10:00)
+How often a full-black rest interlude begins.
+.It Va rest_duration No (duration, default 0:00:20)
+How long each rest interlude lasts.
+.It Va lit_budget No (float, default 0.05)
+Target fraction of lit pixels, 0.0 to 1.0.
+This is a hint passed to the patterns, not a hard limit.
+.El
+.Sh OLED PROTECTION
+OLED panels age in proportion to how long and how brightly each pixel is lit.
+All drawing therefore goes through a post-processing stage:
+.Bl -bullet
+.It
+.Va max_brightness
+limits the brightness of the brightest pixel, at the cost of a dimmer
+display.
+.It
+Pixel shift: every
+.Va shift_interval
+the whole picture takes a slow pseudo-random step, never more than
+.Va shift_max_px
+pixels from its origin, so no pixel stays at the edge of a shape.
+.It
+Rest interlude: every
+.Va rest_interval
+the screen goes entirely black for
+.Va rest_duration ,
+so each pixel gets a recovery period.
+.It
+Lit budget: each pattern is told how large a fraction of the screen it may
+light, and draws sparse content on a black background.
+.It
+No static element persists: the clock drifts and the unlock dialog hides
+itself after
+.Va passwd_timeout .
+.El
+.Pp
+For the best protection use
+.Qq blank
+mode, and enable
+.Va dpms.enabled
+with
+.Va dpms.quick_off
+so that the panel is switched off.
+.Sh XSCREENSAVER COMPATIBILITY
+If
+.Pa ~/.xscreensaver
+exists, these resources are read.
+Names are matched case-insensitively and may carry the usual
+.Li xscreensaver\&. ,
+.Li XScreenSaver* ,
+or
+.Li *
+prefix.
+.Bl -tag -width ".Va dpmsQuickOff"
+.It Va timeout , cycle , lock , lockTimeout , passwdTimeout
+Mapped to the keys of the same name.
+.It Va dpmsEnabled , dpmsStandby , dpmsSuspend , dpmsOff
+Mapped to the
+.Sy [dpms]
+table.
+.It Va dpmsQuickOff
+Also
+.Va dpmsQuickoffEnabled .
+Mapped to
+.Va dpms.quick_off .
+.It Va mode
+.Li one ,
+.Li random ,
+.Li random-same
+(treated as random),
+.Li blank
+and
+.Li off .
+.It Va selected
+Index into the full
+.Va programs
+list (zero-based), re-mapped onto the pattern list.
+.It Va programs
+Only the first word of each entry (the hack name) is used.
+Entries that are disabled with a leading
+.Li -
+or whose name is not a nightsaver pattern are skipped.
+The names
+.Li blank ,
+.Li clock ,
+.Li starfield ,
+.Li stars ,
+.Li matrix ,
+.Li glmatrix
+and
+.Li xmatrix
+are recognised.
+If none match, the built-in list is kept.
+.It Va verbose , splash
+Boolean values.
+.El
+.Pp
+Values written as
+.Li fade
+and
+.Li unfade
+are parsed but have no effect.
+All other resources, including hack options, visual settings and
+.Va lockVTs ,
+are ignored.
+Unparsable values are skipped with a warning in the log.
+Durations in
+.Pa ~/.xscreensaver
+use
+.Li H:MM:SS ,
+.Li MM:SS
+or seconds.
+.Sh FILES
+.Bl -tag -width indent -compact
+.It Pa ~/.config/nightsaver/config.toml
+.It Pa ~/.xscreensaver
+.It Pa /usr/local/etc/nightsaver.toml.sample
+.El
+.Sh EXAMPLES
+A locking, mostly black configuration:
+.Bd -literal -offset indent
+timeout = "0:05:00"
+lock = true
+lock_timeout = "0:00:30"
+mode = "one"
+patterns = ["clock"]
+
+[dpms]
+enabled = true
+quick_off = true
+
+[oled]
+max_brightness = 0.25
+.Ed
+.Sh SEE ALSO
+.Xr nightsaver 1 ,
+.Xr nightsaver-command 1 ,
+.Xr xscreensaver 1

@@ -1,0 +1,309 @@
+.Dd November 8, 2026
+.Dt NIGHTSAVER 1
+.Os
+.Sh NAME
+.Nm nightsaver
+.Nd OLED-friendly Xorg screensaver and PAM screen locker
+.Sh SYNOPSIS
+.Nm
+.Op Fl display Ar host:display.screen
+.Op Fl verbose
+.Op Fl quiet
+.Op Fl no-splash
+.Op Fl log Ar file
+.Op Fl debug
+.Op Fl sync
+.Op Fl Fl lock | Fl Fl no-lock
+.Op Fl Fl config Ar file
+.Op Fl Fl pattern Ar name
+.Nm
+.Fl version
+.Sh DESCRIPTION
+.Nm
+is a screensaver daemon for the X Window System that is designed as a drop-in
+replacement for the
+.Xr xscreensaver 1
+daemon.
+It accepts the same daemon flags, answers the same control protocol (so the
+real
+.Xr xscreensaver-command 1
+works against it), and reads the same
+.Pa ~/.xscreensaver
+resource file for the settings it understands.
+It does not run external xscreensaver hack programs; it draws a small set of
+built-in patterns into a software framebuffer instead.
+Every frame passes through a brightness cap and a burn-in protection stage
+intended for OLED panels.
+.Pp
+After the idle timeout the screen is blanked.
+If locking is enabled, the screen is locked after the lock timeout and a PAM
+password is required to unlock it.
+Only the Xorg server is supported.
+The required server extensions are MIT-SCREEN-SAVER, XInputExtension 2.x,
+XKEYBOARD and RANDR.
+DPMS, MIT-SHM, XFIXES and XINERAMA are optional.
+.Pp
+Only one screensaver may manage a display at a time.
+.Nm
+refuses to start if another daemon (including
+.Xr xscreensaver 1 )
+already owns the display.
+.Sh OPTIONS
+Options may be given with one or two leading dashes.
+.Bl -tag -width indent
+.It Fl display Ar dpy
+Also
+.Fl dpy
+and
+.Fl disp .
+The X display to manage.
+The default is
+.Ev DISPLAY .
+.It Fl verbose
+Also
+.Fl v .
+Increase log verbosity.
+May be repeated, or written
+.Fl vv ,
+.Fl vvv ,
+.Fl vvvv .
+.It Fl quiet
+Suppress informational output (verbosity 0).
+.It Fl no-splash
+Also
+.Fl nosplash .
+Do not show a splash screen.
+This is the default, as
+.Nm
+has no splash screen.
+.It Fl splash
+Accepted for compatibility and ignored.
+.It Fl log Ar file
+Append log messages to
+.Ar file .
+.It Fl debug
+Enable debugging output (raises verbosity to at least 2).
+.It Fl sync
+Also
+.Fl synch ,
+.Fl synchronize ,
+.Fl synchronise .
+Run X synchronously.
+.It Fl Fl lock
+Lock the screen when blanking, overriding the configuration files.
+.It Fl Fl no-lock
+Do not lock the screen when blanking, overriding the configuration files.
+.It Fl Fl config Ar file
+Read this TOML file instead of
+.Pa ~/.config/nightsaver/config.toml .
+The file must exist.
+.It Fl Fl pattern Ar name
+Show only the named pattern (mode
+.Dq one ) .
+See
+.Xr nightsaver.toml 5
+for the pattern names.
+.It Fl Fl demo-blank
+Debugging aid: map black windows on every monitor for three seconds and exit.
+.It Fl version
+Also
+.Fl ver ,
+.Fl vers ,
+.Fl Fl version .
+Print the version, and the xscreensaver version it is compatible with, and exit.
+.It Fl help
+Also
+.Fl Fl help ,
+.Fl h .
+Print a usage summary and exit.
+.El
+.Pp
+Invalid options print a message to standard error and exit with status 1.
+.Sh BEHAVIOUR
+.Ss Idle, blank, lock
+.Nm
+polls the X server's idle time once per second.
+When the user has been idle for the configured
+.Va timeout
+the screen is blanked: a black override-redirect window is mapped over every
+monitor, the cursor is hidden and the keyboard and pointer are grabbed.
+The grab is retried for several seconds if another client holds one.
+The screen is never locked, and the unlock dialog never shown, without a
+successful keyboard and pointer grab.
+.Pp
+While the screen is blanked but not locked, any key press, button press, or
+cumulative pointer movement beyond
+.Va motion_threshold_px
+unblanks it.
+.Pp
+If locking is enabled, the screen becomes locked
+.Va lock_timeout
+after blanking (immediately if that is zero).
+It also locks immediately on
+.Li nightsaver-command -lock ,
+which works even when locking is disabled in the configuration.
+While locked, the first key press or pointer movement wakes the display and
+opens an unlock dialog (that first key press is not used as password input).
+The user types the password and presses Return.
+Escape, or
+.Va passwd_timeout
+seconds without input, hides the dialog again.
+A failed attempt shows an error for two seconds and imposes a delay before the
+next attempt: 1, 2, 4, 8 seconds, then 10 seconds for each further failure.
+A successful PAM result unblanks the screen.
+.Ss Patterns
+.Nm
+displays one of the built-in patterns, chosen according to
+.Va mode ,
+and changes pattern every
+.Va cycle
+seconds.
+.Fl select Ar N
+of
+.Xr nightsaver-command 1
+addresses the configured pattern list, 1-based.
+.Ss DPMS
+If DPMS management is enabled
+.Pq Va dpms.enabled ,
+then on blanking
+.Nm
+saves the server's DPMS timeouts, installs the configured standby, suspend and
+off timeouts and enables DPMS.
+With
+.Va dpms.quick_off
+the monitor is powered off immediately.
+On unblanking the monitor is forced on and the saved settings are restored.
+.Li nightsaver-command -suspend
+powers the monitor off immediately.
+Without the DPMS extension these steps are skipped.
+.Pp
+DPMS has not yet been tested on real hardware.
+.Ss Configuration reload
+The configuration files are checked every five seconds, and reloaded when
+their modification time changes or when
+.Nm
+receives
+.Dv SIGHUP .
+A file that fails to parse is reported in the log and the previous settings
+are kept.
+A reload never changes the lock state of a screen that is already locked.
+.Ss Signals
+.Bl -tag -width ".Dv SIGTERM , SIGINT"
+.It Dv SIGHUP
+Reload the configuration.
+.It Dv SIGTERM , SIGINT
+Shut down cleanly.
+Both are ignored, with a message in the log, while the screen is locked.
+.It Dv SIGPIPE
+Ignored.
+.El
+.Pp
+Do not use
+.Dv SIGKILL
+on a running locker.
+.Sh FILES
+.Bl -tag -width indent
+.It Pa ~/.config/nightsaver/config.toml
+Per-user configuration;
+.Ev XDG_CONFIG_HOME
+is honoured.
+See
+.Xr nightsaver.toml 5 .
+.It Pa ~/.xscreensaver
+xscreensaver resource file; a subset of keys is read.
+.It Pa /usr/local/etc/nightsaver.toml.sample
+Annotated sample configuration.
+.It Pa /usr/local/etc/pam.d/xscreensaver
+PAM service used by default.
+.It Pa /usr/local/etc/pam.d/nightsaver
+Optional PAM service, used only when
+.Va pam_service
+is set to
+.Dq nightsaver .
+.El
+.Sh EXIT STATUS
+.Ex -std
+Usage errors, a failure to open the display and the presence of another
+screensaver all produce status 1.
+The daemon runs until it receives the
+.Cm exit
+command or
+.Dv SIGTERM
+(0 status), or a fatal X error occurs.
+.Sh SECURITY
+Authentication uses OpenPAM.
+.Nm
+runs as the invoking user and is
+.Em not
+setuid.
+The default PAM service is
+.Dq xscreensaver ;
+its policy uses
+.Xr pam_exec 8
+to run the setuid helper
+.Pa unix-selfauth-helper ,
+which verifies the calling user's own password, so no privilege is needed in
+.Nm
+itself.
+Any PAM error is treated as a failed unlock, never as success.
+Password buffers are zeroed after use and neither passwords nor key input are
+logged.
+.Pp
+While the screen is locked:
+.Bl -bullet -compact
+.It
+The windows are never unmapped, and the daemon never exits, except after a
+successful PAM result.
+.It
+The
+.Cm exit
+and
+.Cm restart
+commands are refused, and
+.Dv SIGTERM
+and
+.Dv SIGINT
+are ignored.
+.It
+The windows are raised again if they are covered, and the grabs are
+re-established if lost.
+.El
+.Pp
+As with
+.Xr xscreensaver 1 ,
+a lock screen on X11 is only as strong as the X server.
+It cannot defend against:
+.Bl -bullet -compact
+.It
+the X server being killed, for example with Ctrl-Alt-Backspace if the keymap
+enables it (this returns to the login manager, or to a console);
+.It
+switching to a virtual terminal where a login session is open (Ctrl-Alt-Fn);
+.It
+other X clients that were able to grab the input devices before
+.Nm ,
+or X server debugging or "kill" key combinations;
+.It
+anyone with root access, or access to the user's X authority.
+.El
+.Pp
+If virtual terminals are a concern, make sure no unlocked console session is
+left logged in.
+.Sh SEE ALSO
+.Xr nightsaver-command 1 ,
+.Xr xscreensaver 1 ,
+.Xr xscreensaver-command 1 ,
+.Xr pam 3 ,
+.Xr nightsaver.toml 5
+.Sh AUTHORS
+.An Lucas Holt
+.Sh BUGS
+Only Xorg is supported; there is no Wayland support.
+Running xscreensaver hack programs, the xscreensaver settings dialog, fading
+(the
+.Va fade
+and
+.Va unfade
+resources are parsed but ignored) and D-Bus or systemd inhibition are not
+implemented.
+Multi-monitor hotplug and DPMS on real hardware have not yet been tested.
