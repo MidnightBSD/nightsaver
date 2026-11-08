@@ -183,9 +183,10 @@ tests/xvfb_smoke.sh                # integration test on a private Xvfb (:99), n
 debug binaries plus the grab-holding helper (`cargo build --all-targets` first). Do not run the daemon on your live display for testing without
 stopping the real saver first.
 
-Not yet tested: DPMS on real hardware (Xvfb has no DPMS extension), multi-monitor hotplug, and
-the MIT-SHM path (rendering uses plain `PutImage`). The unlock path has been exercised with a mock
-authenticator in unit tests; check it against your own PAM setup before relying on it.
+Verified on a live MidnightBSD 4.2 Xorg session: blanking, wake on activity, and locking with a
+real password accepted and a wrong one rejected through the `nightsaver` PAM policy.
+Not yet tested: DPMS on real hardware (neither Xvfb nor the test machine's Xorg has the DPMS
+extension), multi-monitor hotplug, and the MIT-SHM path (rendering uses plain `PutImage`).
 
 ## License
 
