@@ -59,6 +59,11 @@ etc/ man/ tests/ Makefile      packaging, man pages, Xvfb smoke test
 9. Never run the daemon on `DISPLAY=:0` without being told; use `Xvfb :99` (`tests/xvfb_smoke.sh`).
    Never `kill -9` a running locker.
 10. Commits: only when asked. Messages are imperative, one line summary, body explains why.
+11. **Changes go through pull requests.** Never commit to or push `master` directly. For each
+    piece of work create a branch from the current `origin/master` (short kebab-case name, e.g.
+    `starfield-streaks`), commit there, push it, and open a PR against `master` on
+    https://github.com/MidnightBSD/nightsaver with `gh pr create` (summary, why, how it was
+    tested). The user merges. Rebasing or force-pushing `master` is never allowed.
 
 ## Testing cheatsheet
 
