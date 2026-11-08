@@ -1,6 +1,6 @@
 [package]
 name = "nightsaver"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.96"
 license = "BSD-2-Clause"
@@ -20,6 +20,10 @@ path = "src/bin/nightsaver.rs"
 [[bin]]
 name = "nightsaver-command"
 path = "src/bin/nightsaver-command.rs"
+
+[[bin]]
+name = "nightsaver-auth"
+path = "src/bin/nightsaver-auth.rs"
 
 [dependencies]
 x11rb = { version = "0.14", features = ["allow-unsafe-code", "image", "screensaver", "xinput", "xkb", "randr", "dpms", "shm", "xfixes"] }

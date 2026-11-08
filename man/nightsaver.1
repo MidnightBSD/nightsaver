@@ -231,9 +231,15 @@ command or
 .Dv SIGTERM
 (0 status), or a fatal X error occurs.
 .Sh SECURITY
-Authentication uses OpenPAM.
+Authentication uses OpenPAM, in a separate helper process
+.Pa libexec/nightsaver-auth
+that
 .Nm
-runs as the invoking user and is
+starts for each unlock attempt and feeds the password over a pipe.
+Only a clean exit status 0 of the helper unlocks; a crash, a signal or a helper that
+does not finish within 25 seconds (it is then killed) counts as a denial.
+.Nm
+and the helper run as the invoking user and are
 .Em not
 setuid.
 Configuration files must be regular files owned by the user or root and not writable by
