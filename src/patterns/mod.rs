@@ -2,6 +2,7 @@
 pub mod blank;
 pub mod cat;
 pub mod clock;
+pub mod juggler;
 pub mod matrix;
 pub mod midnight;
 pub mod starfield;
@@ -46,7 +47,7 @@ pub trait Pattern: Send {
 }
 
 /// All pattern names, in canonical order (used for xscreensaver `-select N`, 1-based).
-pub const NAMES: &[&str] = &["blank", "clock", "starfield", "matrix", "midnight", "cat"];
+pub const NAMES: &[&str] = &["blank", "clock", "starfield", "matrix", "midnight", "cat", "juggler"];
 
 /// Construct a pattern by name. Unknown names (e.g. xscreensaver hack names in
 /// `programs:`) map to `None`; callers fall back to "clock".
@@ -58,6 +59,7 @@ pub fn by_name(name: &str) -> Option<Box<dyn Pattern>> {
         "matrix" | "glmatrix" | "xmatrix" => Some(Box::new(matrix::Matrix::default())),
         "midnight" | "midnightbsd" | "logo" => Some(Box::new(midnight::Midnight::default())),
         "cat" | "asciicat" | "kitty" => Some(Box::new(cat::Cat::default())),
+        "juggler" | "juggle" => Some(Box::new(juggler::Juggler::default())),
         _ => None,
     }
 }
