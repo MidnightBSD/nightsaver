@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.96"
 license = "BSD-2-Clause"
 description = "OLED-friendly Xorg screensaver and PAM screen locker, xscreensaver drop-in"
-repository = "https://github.com/laffer1/nightsaver"
+repository = "https://github.com/MidnightBSD/nightsaver"
 
 build = "build.rs"
 
