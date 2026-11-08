@@ -4,7 +4,7 @@ An OLED-friendly Xorg screensaver and PAM screen locker for MidnightBSD, written
 It is a drop-in replacement for the `xscreensaver` daemon and the `xscreensaver-command`
 control client.
 
-Status: **v0.1, Xorg only.** There is no Wayland support.
+Status: **v0.2, Xorg only.** There is no Wayland support.
 
 ## Features
 
