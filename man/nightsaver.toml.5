@@ -108,7 +108,7 @@ shows pure black;
 .Qq off
 never activates.
 Any other value is an error.
-.It Va patterns No (array of strings, default Qq clock , Qq starfield , Qq matrix )
+.It Va patterns No (array of strings, default Qq clock , Qq starfield , Qq matrix , Qq midnight )
 The pattern list.
 An empty array is ignored.
 Names are:
@@ -121,6 +121,9 @@ A time display that drifts slowly around the screen.
 Stars flying outward.
 .It matrix
 Falling character rain.
+.It midnight
+The MidnightBSD logo as a drifting outline with a twinkling fill, and the
+boot loader's ASCII brand beneath it.
 .El
 .Pp
 Also accepted as aliases:
@@ -251,7 +254,10 @@ The names
 .Li starfield ,
 .Li stars ,
 .Li matrix ,
-.Li glmatrix
+.Li glmatrix ,
+.Li midnight ,
+.Li midnightbsd ,
+.Li logo
 and
 .Li xmatrix
 are recognised.

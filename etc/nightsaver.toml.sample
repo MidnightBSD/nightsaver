@@ -40,8 +40,8 @@
 # Pattern selection: "one" (only patterns[selected]), "random", "blank" (pure black), "off" (never activate).
 # mode = "random"
 
-# Pattern names: blank, clock, starfield, matrix.
-# patterns = ["clock", "starfield", "matrix"]
+# Pattern names: blank, clock, starfield, matrix, midnight.
+# patterns = ["clock", "starfield", "matrix", "midnight"]
 
 # 0-based index into patterns, used when mode = "one".
 # selected = 0

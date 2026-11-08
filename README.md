@@ -88,7 +88,7 @@ timeout = "0:05:00"        # idle time before blanking
 lock = true                # require a password
 lock_timeout = "0:00:30"   # lock this long after blanking
 mode = "random"            # one | random | blank | off
-patterns = ["clock", "starfield", "matrix"]
+patterns = ["clock", "starfield", "matrix", "midnight"]
 
 [dpms]
 enabled = true
@@ -135,9 +135,10 @@ reachable, 1 for usage errors. `-demo` is parsed but answered with "not supporte
 | `clock`     | A time display that drifts around the screen.                |
 | `starfield` | Stars flying outward (alias `stars`).                        |
 | `matrix`    | Falling character rain (aliases `glmatrix`, `xmatrix`).      |
+| `midnight`  | The MidnightBSD logo as a drifting outline with twinkling fill, and the boot loader's ASCII brand (aliases `midnightbsd`, `logo`). |
 
 `-select N` and `-next`/`-prev` index the configured `patterns` list. The default list is
-`clock`, `starfield`, `matrix`; `blank` is available by name or via `mode = "blank"`.
+`clock`, `starfield`, `matrix`, `midnight`; `blank` is available by name or via `mode = "blank"`.
 
 ## OLED design notes
 
