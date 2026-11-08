@@ -94,6 +94,9 @@ pub fn parse_str(s: &str) -> Result<TomlConfig, ConfigError> {
 
 /// Load a config file; `Ok(None)` if it does not exist.
 pub fn load(path: &Path) -> Result<Option<TomlConfig>, ConfigError> {
+    if let Some(why) = super::untrusted_file(path) {
+        return Err(ConfigError::Parse(format!("{}: {why}", path.display())));
+    }
     match std::fs::read_to_string(path) {
         Ok(s) => parse_str(&s)
             .map(Some)
@@ -104,13 +107,18 @@ pub fn load(path: &Path) -> Result<Option<TomlConfig>, ConfigError> {
 }
 
 /// `$XDG_CONFIG_HOME/nightsaver/config.toml`, else `$HOME/.config/nightsaver/config.toml`.
-pub fn default_path() -> PathBuf {
+/// `None` when neither gives an absolute directory: a relative path would be resolved against
+/// the working directory, where another user may have planted a file.
+pub fn default_path() -> Option<PathBuf> {
     let nonempty = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
     let base = match nonempty("XDG_CONFIG_HOME") {
         Some(x) => PathBuf::from(x),
-        None => PathBuf::from(nonempty("HOME").unwrap_or_default()).join(".config"),
+        None => PathBuf::from(nonempty("HOME")?).join(".config"),
     };
-    base.join("nightsaver").join("config.toml")
+    if !base.is_absolute() {
+        return None;
+    }
+    Some(base.join("nightsaver").join("config.toml"))
 }
 
 #[cfg(test)]

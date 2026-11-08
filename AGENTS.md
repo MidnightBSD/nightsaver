@@ -43,7 +43,11 @@ etc/ man/ tests/ Makefile      packaging, man pages, Xvfb smoke test
    - Never show the unlock dialog without a successful keyboard **and** pointer grab.
    - Password buffers are `zeroize::Zeroizing`; never log them or any key input.
    - PAM/system errors are treated as "denied", never as "unlocked".
-   - `EXIT`/`RESTART` commands and SIGTERM are ignored while locked (log and continue).
+   - `EXIT`/`RESTART`/`DEACTIVATE` commands and SIGTERM are ignored while locked **or while a lock
+     is pending** (grab not yet acquired); a pending lock shows a visible "NOT LOCKED" notice.
+   - Fail closed: an unknown user name, a PAM failure of any kind, or a hung authenticator all
+     mean "denied", never "unlocked". Synthetic (`XSendEvent`) events other than ClientMessage
+     are dropped. Config and log files are checked for ownership and mode before use.
 4. **xscreensaver compatibility is defined by behaviour**, verified with the real
    `/usr/local/bin/xscreensaver-command` and `xprop -root`. When in doubt read the xscreensaver
    source (`driver/remote.c`, `driver/windows.c`, `driver/xscreensaver.c`, `driver/prefs.c`) rather

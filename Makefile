@@ -90,7 +90,13 @@ uninstall:
 	rm -f $(DESTDIR)$(APPDIR)/nightsaver.desktop $(DESTDIR)$(APPDIR)/nightsaver-lock.desktop
 	rm -f $(DESTDIR)$(AUTOSTARTDIR)/nightsaver.desktop
 	@for link in xscreensaver xscreensaver-command; do \
-		if [ -L $(DESTDIR)$(BINDIR)/$$link ]; then rm -f $(DESTDIR)$(BINDIR)/$$link; fi; \
+		if [ -L "$(DESTDIR)$(BINDIR)/$$link" ]; then \
+			case "$$(readlink "$(DESTDIR)$(BINDIR)/$$link")" in \
+				nightsaver|nightsaver-command|*/nightsaver|*/nightsaver-command) \
+					rm -f "$(DESTDIR)$(BINDIR)/$$link" ;; \
+				*) echo "$(DESTDIR)$(BINDIR)/$$link is not a nightsaver link; left alone" ;; \
+			esac; \
+		fi; \
 	done
 	@if cmp -s etc/pam.d/nightsaver $(DESTDIR)$(PAMDIR)/nightsaver 2>/dev/null; then \
 		rm -f $(DESTDIR)$(PAMDIR)/nightsaver; \

@@ -58,6 +58,8 @@ const PROGNAME: &str = "nightsaver";
 const IDLE_POLL: Duration = Duration::from_secs(1);
 const CONFIG_CHECK: Duration = Duration::from_secs(5);
 const GRAB_RETRY: Duration = Duration::from_secs(1);
+/// Upper bound on X events handled per loop iteration before timers run.
+const MAX_EVENTS_PER_ITERATION: usize = 256;
 /// How long activation waits for the grab (xscreensaver tries 4 x 1 s). Command replies are
 /// sent after activation, and xscreensaver-command gives up after about 10 s.
 const GRAB_TIMEOUT: Duration = Duration::from_secs(3);
@@ -95,6 +97,17 @@ mod lockapi {
 
     pub fn new_locker(user: String, service: String, passwd_timeout: Duration) -> Locker {
         Locker::new(user, service, passwd_timeout)
+    }
+    /// A locker whose every attempt is denied (used when the user name is unknown).
+    pub fn new_denying_locker(passwd_timeout: Duration) -> Locker {
+        use crate::lock::pam::PamError;
+        use std::sync::Arc;
+        Locker::with_auth(
+            String::new(),
+            String::new(),
+            passwd_timeout,
+            Arc::new(|_, _, _| Err(PamError::System("user name unknown".into()))),
+        )
     }
     pub fn key(l: &mut Locker, k: KeyInput, now: Instant) -> LockEvent {
         l.key(k, now)
@@ -151,6 +164,8 @@ extern "C" fn on_hup(_: libc::c_int) {
 
 fn install_signal_handlers() {
     use nix::sys::signal::{SigHandler, Signal, signal};
+    // SIGCHLD is inherited; if a parent left it at SIG_IGN, pam_exec's waitpid() fails and
+    // every unlock attempt is denied. Restore the default disposition.
     let set = |sig: Signal, h: SigHandler| {
         // SAFETY: the handlers only store to a static AtomicBool, which is async-signal-safe;
         // SIG_IGN for SIGPIPE has no handler code at all.
@@ -162,6 +177,7 @@ fn install_signal_handlers() {
     set(Signal::SIGINT, SigHandler::Handler(on_term));
     set(Signal::SIGHUP, SigHandler::Handler(on_hup));
     set(Signal::SIGPIPE, SigHandler::SigIgn);
+    set(Signal::SIGCHLD, SigHandler::SigDfl);
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +334,7 @@ pub fn run(args: Args, cfg: Config) -> Result<(), Box<dyn Error>> {
             .ok()
             .flatten()
             .unwrap_or_else(|| "???".into());
+        let id: String = id.chars().map(|c| if c.is_control() { '?' } else { c }).collect();
         eprintln!(
             "{PROGNAME}: already running on display {display_name} (window 0x{w:x})\n from process {id}"
         );
@@ -546,11 +563,18 @@ impl Daemon {
         let now = Instant::now();
         let timeout = self.next_deadline(now).saturating_duration_since(now);
         let mut ev = self.next_event(Some(timeout))?;
+        let mut handled = 0usize;
         while let Some(e) = ev {
             match self.handle_event(e) {
                 Ok(Some(exit)) => return Ok(Some(exit)),
                 Ok(None) => {}
                 Err(e) => self.recoverable(e)?,
+            }
+            handled += 1;
+            if handled >= MAX_EVENTS_PER_ITERATION {
+                // A client flooding us with events must not starve the timers (PAM results,
+                // dialog timeouts, rendering). The rest is picked up next iteration.
+                break;
             }
             ev = self.next_event(None)?;
         }
@@ -649,8 +673,8 @@ impl Daemon {
             self.reload_config();
         }
         if SIG_TERM.swap(false, Ordering::SeqCst) {
-            if self.state == SaverState::Locked {
-                log::warn!("SIGTERM/SIGINT received while locked: ignored");
+            if self.state == SaverState::Locked || self.lock_pending {
+                log::warn!("SIGTERM/SIGINT received while locked (or lock pending): ignored");
             } else {
                 log::info!("SIGTERM/SIGINT received: shutting down");
                 self.deactivate(Why::Exit);
@@ -732,6 +756,13 @@ impl Daemon {
     // Events
     // -----------------------------------------------------------------------
     fn handle_event(&mut self, ev: Event) -> Result<Option<Exit>, Box<dyn Error>> {
+        // Any client can SendEvent arbitrary events to our windows. Only ClientMessage (the
+        // control protocol) is legitimately synthetic; forged Unmap/Focus/XKB/Configure events
+        // would otherwise hide the dialog, alter modifier state or force relayouts.
+        if ev.sent_event() && !matches!(ev, Event::ClientMessage(_)) {
+            log::trace!("synthetic event ignored: {}", event_name(&ev));
+            return Ok(None);
+        }
         if let Some(kb) = self.keyboard.as_mut()
             && lockapi::keyboard_event(kb, &ev)
         {
@@ -1017,7 +1048,8 @@ impl Daemon {
     /// Locking needs a user name for PAM. A missing keyboard does not disable locking (L6):
     /// it is retried at lock time and, failing that, the screen locks anyway.
     fn can_lock(&self) -> bool {
-        self.user.is_some()
+        // Locking never depends on the user lookup: see `lock_now` (fail closed).
+        true
     }
 
     /// Reply to a command once its action has finished: `+ok_msg`, or `-reason` on error (the
@@ -1060,6 +1092,12 @@ impl Daemon {
                 match self.state {
                     SaverState::Idle => {
                         self.respond(true, "already inactive, resetting activity time");
+                    }
+                    SaverState::Blanked if self.lock_pending => {
+                        // A lock is waiting for the grab: behave as if locked.
+                        log::info!("DEACTIVATE while a lock is pending: keeping the screen blanked");
+                        self.respond(true, "deactivating");
+                        self.dpms_on();
                     }
                     SaverState::Blanked => {
                         self.respond(true, "deactivating");
@@ -1141,8 +1179,8 @@ impl Daemon {
                 self.dpms_off();
             }
             Command::Exit | Command::Restart => {
-                if self.state == SaverState::Locked {
-                    log::warn!("{cmd:?} refused: screen is locked");
+                if self.state == SaverState::Locked || self.lock_pending {
+                    log::warn!("{cmd:?} refused: screen is locked or a lock is pending");
                     self.respond(false, "screen is locked");
                 } else {
                     let restart = cmd == Command::Restart;
@@ -1271,11 +1309,7 @@ impl Daemon {
                     log::debug!("keyboard and pointer grabbed");
                 }
                 self.grabbed = true;
-                // Sequence boundary for stale FocusIn/Out(Ungrab) events (see `grab_seq`).
-                if let Ok(c) = self.x.conn.get_input_focus() {
-                    self.grab_seq = c.sequence_number() as u16;
-                    let _ = c.reply();
-                }
+                self.mark_grab_seq();
                 self.next_grab_retry = None;
                 self.next_grab_reassert = Some(later(now, GRAB_REASSERT));
             }
@@ -1291,6 +1325,16 @@ impl Daemon {
                 }
                 self.next_grab_retry = Some(later(now, GRAB_RETRY));
             }
+        }
+    }
+
+    /// Record the sequence boundary for stale FocusIn/Out(Ungrab) events (see `grab_seq`).
+    /// Called after every successful grab or re-grab, since the 16-bit window wraps after
+    /// 32768 requests (a few minutes of rendering).
+    fn mark_grab_seq(&mut self) {
+        if let Ok(c) = self.x.conn.get_input_focus() {
+            self.grab_seq = c.sequence_number() as u16;
+            let _ = c.reply();
         }
     }
 
@@ -1319,7 +1363,10 @@ impl Daemon {
             return;
         }
         match grab::reassert(&self.x, self.x.root) {
-            Ok(true) => self.next_grab_reassert = Some(later(Instant::now(), GRAB_REASSERT)),
+            Ok(true) => {
+                self.mark_grab_seq();
+                self.next_grab_reassert = Some(later(Instant::now(), GRAB_REASSERT));
+            }
             Ok(false) => self.grab_lost("periodic re-grab failed"),
             Err(e) => self.grab_lost(&format!("periodic re-grab failed: {e}")),
         }
@@ -1395,6 +1442,14 @@ impl Daemon {
                     continue;
                 }
             };
+            let fb = match Framebuffer::try_new(w, h) {
+                Ok(fb) => fb,
+                Err(e) => {
+                    log::error!("cannot allocate a {w}x{h} framebuffer for monitor {mon:?} ({e}); it stays black");
+                    presenter.destroy(&self.x);
+                    continue;
+                }
+            };
             let mut rng = Rng::new(self.rng.next_u32() as u64 | (u64::from(self.rng.next_u32()) << 32));
             let mut pattern = patterns::by_name(&name).unwrap_or_else(|| {
                 log::warn!("unknown pattern {name:?}: using clock");
@@ -1404,7 +1459,7 @@ impl Daemon {
             self.screens.push(Screen {
                 win,
                 mon,
-                fb: Framebuffer::new(w, h),
+                fb,
                 presenter,
                 pattern,
                 oled: OledGuard::new(self.cfg.oled.clone()),
@@ -1459,10 +1514,10 @@ impl Daemon {
             SaverState::Idle => return false,
             SaverState::Blanked => {}
         }
-        let Some(user) = self.user.clone() else {
-            log::error!("cannot lock: user name unknown");
-            return false;
-        };
+        if self.user.is_none() {
+            // The lookup failed at startup (NIS/LDAP outage?); try once more now.
+            self.user = lockapi::current_username();
+        }
         if !self.grabbed {
             self.try_grab(Duration::from_millis(500));
         }
@@ -1489,11 +1544,18 @@ impl Daemon {
                 ),
             }
         }
-        self.locker = Some(lockapi::new_locker(
-            user,
-            self.cfg.pam_service.clone(),
-            self.cfg.passwd_timeout,
-        ));
+        self.locker = Some(match self.user.clone() {
+            Some(user) => lockapi::new_locker(user, self.cfg.pam_service.clone(), self.cfg.passwd_timeout),
+            None => {
+                // Fail closed: lock, but no attempt can succeed because we do not know whom to
+                // authenticate. Better than leaving the screen unlocked.
+                log::error!(
+                    "user name unknown: locking anyway; every unlock attempt will be denied until \
+                     the daemon is restarted from another session"
+                );
+                lockapi::new_denying_locker(self.cfg.passwd_timeout)
+            }
+        });
         self.state = SaverState::Locked;
         self.lock_pending = false;
         self.lock_deadline = None;
@@ -1575,7 +1637,7 @@ impl Daemon {
         if self.grabbed {
             // Cheap confirmation that the root grab survived.
             match grab::reassert(&self.x, self.x.root) {
-                Ok(true) => {}
+                Ok(true) => self.mark_grab_seq(),
                 Ok(false) => self.grab_lost("re-grab after relayout failed"),
                 Err(e) => self.grab_lost(&format!("re-grab after relayout failed: {e}")),
             }
@@ -1701,12 +1763,9 @@ impl Daemon {
         let now = Instant::now();
         let dt = now.saturating_duration_since(self.last_frame).min(Duration::from_millis(250));
         self.last_frame = now;
-        let dialog_on = self
-            .screens
-            .iter()
-            .position(|s| s.mon.primary)
-            .unwrap_or(0);
+        let dialog_on = dialog_screen(&self.screens);
         let show_dialog = self.state == SaverState::Locked && self.grabbed;
+        let not_locked = self.lock_pending && !self.grabbed;
         let no_keyboard = self.keyboard.is_none();
         for (i, s) in self.screens.iter_mut().enumerate() {
             s.fb.clear();
@@ -1720,8 +1779,13 @@ impl Daemon {
                     lockapi::draw(&mut s.fb, l, now);
                 }
                 if no_keyboard {
-                    draw_notice(&mut s.fb, "keyboard unavailable: cannot unlock");
+                    draw_notice(&mut s.fb, "keyboard unavailable: cannot unlock", now);
                 }
+            }
+            if not_locked {
+                // Never let a black screen pass for a lock: another client holds a grab and
+                // keystrokes may reach it.
+                draw_notice(&mut s.fb, "NOT LOCKED: another program holds the keyboard or mouse", now);
             }
             s.presenter.present(&self.x, s.win, &s.fb)?;
         }
@@ -1859,14 +1923,60 @@ impl Daemon {
     }
 }
 
-/// One line of dim text centred near the bottom of `fb`.
-fn draw_notice(fb: &mut Framebuffer, text: &str) {
+/// One line of dim text centred near the bottom of `fb`, drifting a little (OLED).
+fn draw_notice(fb: &mut Framebuffer, text: &str, now: Instant) {
     use crate::render::font;
     let scale = 2;
     let w = font::text_width(text, scale);
-    let x = (fb.width as i32 - w) / 2;
-    let y = fb.height as i32 - 40;
+    let t = now.duration_since(*EPOCH).as_secs() as i32;
+    let drift = (t / 7) % 24 - 12;
+    let x = (fb.width as i32 - w) / 2 + drift;
+    let y = fb.height as i32 - 40 + ((t / 11) % 10 - 5);
     font::draw_text(fb, x.max(0), y.max(0), scale, crate::render::rgb(0x80, 0x30, 0x30), text);
+}
+
+static EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+
+/// Which screen gets the unlock dialog: the primary monitor if it is big enough to show the
+/// panel, else the largest. The primary flag is client-settable (RRSetMonitor), so a tiny
+/// "primary" must not be able to hide the dialog.
+fn dialog_screen(screens: &[Screen]) -> usize {
+    let geo: Vec<(u32, u32, bool)> = screens.iter().map(|s| (s.fb.width, s.fb.height, s.mon.primary)).collect();
+    pick_dialog(&geo)
+}
+
+/// `(width, height, primary)` per screen -> index that shows the dialog.
+fn pick_dialog(screens: &[(u32, u32, bool)]) -> usize {
+    const MIN_W: u32 = 320;
+    const MIN_H: u32 = 200;
+    let big = |s: &(u32, u32, bool)| s.0 >= MIN_W && s.1 >= MIN_H;
+    if let Some(i) = screens.iter().position(|s| s.2 && big(s)) {
+        return i;
+    }
+    screens
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, s)| u64::from(s.0) * u64::from(s.1))
+        .map_or(0, |(i, _)| i)
+}
+
+
+/// Short name of an event for trace logs (never formats key data).
+fn event_name(ev: &Event) -> &'static str {
+    match ev {
+        Event::UnmapNotify(_) => "UnmapNotify",
+        Event::MapNotify(_) => "MapNotify",
+        Event::DestroyNotify(_) => "DestroyNotify",
+        Event::ConfigureNotify(_) => "ConfigureNotify",
+        Event::FocusIn(_) => "FocusIn",
+        Event::FocusOut(_) => "FocusOut",
+        Event::KeyPress(_) => "KeyPress",
+        Event::ButtonPress(_) => "ButtonPress",
+        Event::MotionNotify(_) => "MotionNotify",
+        Event::PropertyNotify(_) => "PropertyNotify",
+        Event::VisibilityNotify(_) => "VisibilityNotify",
+        _ => "other",
+    }
 }
 
 /// `--demo-blank`: blank every monitor for 3 s with a small grey marker in each monitor's
@@ -1923,4 +2033,18 @@ pub fn demo_blank(display: Option<&str>) -> Result<(), Box<dyn std::error::Error
     })();
     wins.destroy(&x);
     result
+}
+
+#[cfg(test)]
+mod dialog_tests {
+    use super::pick_dialog;
+
+    #[test]
+    fn primary_wins_only_when_big_enough() {
+        assert_eq!(pick_dialog(&[(1920, 1080, false), (1280, 800, true)]), 1);
+        // A 4x4 "primary" planted via RRSetMonitor cannot hide the dialog.
+        assert_eq!(pick_dialog(&[(1920, 1080, false), (4, 4, true)]), 0);
+        assert_eq!(pick_dialog(&[(100, 100, false), (200, 150, false)]), 1);
+        assert_eq!(pick_dialog(&[]), 0);
+    }
 }

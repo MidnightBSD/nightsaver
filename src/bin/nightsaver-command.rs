@@ -397,7 +397,7 @@ impl<C: Connection> Ctx<'_, C> {
                 format_args!("class hints not set on window 0x{win:x}?"),
             );
         };
-        print!("{class} {v}");
+        print!("{} {}", printable(&class), printable(&v));
         if !time {
             println!();
             return Ok(0);
@@ -460,12 +460,12 @@ impl<C: Connection> Ctx<'_, C> {
         match resp {
             Some(Response::Reply { ok: true, text }) => {
                 if self.verbosity > 0 {
-                    println!("{prog}: {text}\n");
+                    println!("{prog}: {}\n", printable(&text));
                 }
             }
             Some(Response::Reply { ok: false, text }) => {
                 flush_all();
-                eprintln!("{prog}: {text}\n");
+                eprintln!("{prog}: {}\n", printable(&text));
                 return Ok(EXIT_FAIL);
             }
             Some(Response::NoResponse) => fail(prog, "no response to command."),
@@ -570,4 +570,10 @@ fn reset_dpms_timer<C: Connection>(conn: &C) {
     };
     let _ = run();
     let _ = conn.get_input_focus().map(|c| c.reply());
+}
+
+/// Strings read from X properties are written by other clients: strip control characters
+/// (terminal escape sequences) before printing them.
+fn printable(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() && c != '\n' { '?' } else { c }).collect()
 }

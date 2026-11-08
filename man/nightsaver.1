@@ -236,6 +236,19 @@ Authentication uses OpenPAM.
 runs as the invoking user and is
 .Em not
 setuid.
+Configuration files must be regular files owned by the user or root and not writable by
+group or others; otherwise they are ignored with an error, because they select the PAM
+service.
+While a lock is pending (another client holds an input grab), the screen stays blanked
+with a visible
+.Dq NOT LOCKED
+notice and
+.Fl deactivate ,
+.Fl exit ,
+.Fl restart
+and
+.Dv SIGTERM
+are refused, exactly as when locked.
 The default PAM service is
 .Dq xscreensaver ;
 its policy uses

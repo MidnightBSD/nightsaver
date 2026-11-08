@@ -75,6 +75,8 @@ pub struct Keyboard {
     keymap: xk::Keymap,
     state: xk::State,
     stale: bool,
+    /// Set after a failed reload: do not retry (or log) before this instant.
+    retry_after: Option<std::time::Instant>,
 }
 
 impl std::fmt::Debug for Keyboard {
@@ -147,7 +149,7 @@ impl Keyboard {
             )?
             .check()?;
 
-        Ok(Keyboard { context, device_id, keymap, state, stale: false })
+        Ok(Keyboard { context, device_id, keymap, state, stale: false, retry_after: None })
     }
 
     /// Feed an X event. Applies XKB state changes immediately and marks the keymap stale on
@@ -204,7 +206,22 @@ impl Keyboard {
         if !self.stale {
             return Ok(());
         }
-        self.reload(x)
+        let now = std::time::Instant::now();
+        if self.retry_after.is_some_and(|t| now < t) {
+            return Ok(());
+        }
+        match self.reload(x) {
+            Ok(()) => {
+                self.retry_after = None;
+                Ok(())
+            }
+            Err(e) => {
+                // The old keymap keeps working; retry (and warn) at most every 5 s instead of
+                // on every loop iteration.
+                self.retry_after = now.checked_add(std::time::Duration::from_secs(5));
+                Err(e)
+            }
+        }
     }
 
     /// Unconditionally re-read keymap and state from the server.

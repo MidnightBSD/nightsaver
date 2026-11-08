@@ -693,11 +693,11 @@ pub fn wait_response<C: Connection>(
         // The C client blocks in select() and wakes immediately. For EXIT the
         // daemon destroys its window right after replying, so a coarse sleep
         // loses the race to read the reply. Spin (yielding) briefly, then back off.
-        if started.elapsed() < Duration::from_millis(1500) {
-            std::thread::yield_now();
+        std::thread::sleep(if started.elapsed() < Duration::from_millis(1500) {
+            Duration::from_millis(1)
         } else {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+            Duration::from_millis(10)
+        });
     }
     let cookie = conn.get_property(true, saver_win, resp, AtomEnum::ANY, 0, 1024)?;
     match cookie.reply() {
