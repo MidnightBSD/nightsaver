@@ -20,13 +20,19 @@
 //! - Every problem opening, locking or reading the state file is **fail-open** (the attempt
 //!   runs unthrottled): the throttle may never stand between the user and unlocking, and a
 //!   broken state file must not turn into a lockout.
-//! - Only *contention* — another attempt of the same uid holding the slot longer than
-//!   `MAX_WAIT` — is a denial. That can only come from the user's own processes (the state
-//!   file is per-uid), so it cannot be used to lock out a different account.
+//! - The state file is verified on the opened handle (`config::untrusted_metadata`): it
+//!   must be a regular file owned by us or root and not group/others-writable; anything
+//!   else bypasses the throttle and logs a warning. This is what keeps a planted `/tmp`
+//!   file (a 0666 seed another uid holds `flock` on, a FIFO, a device) from delaying or
+//!   refusing someone else's unlock attempt - without the check, contention would be
+//!   forgeable cross-uid.
+//! - Only *contention* — another attempt holding the slot longer than `MAX_WAIT` — is a
+//!   denial, and with the check above the holder can only be a process running as the same
+//!   user (or root, which can do anything anyway).
 //!
-//! The state file is `/tmp/.nightsaver-auth-<uid>.lock` (0600, `O_NOFOLLOW`): a hard-coded
-//! directory, because `TMPDIR` is caller-controlled. Kernel locks are released even when
-//! the helper is killed mid-PAM, so a hung attempt cannot wedge the slot.
+//! The state file is `/tmp/.nightsaver-auth-<uid>.lock` (0600, `O_NOFOLLOW`, `O_NONBLOCK`):
+//! a hard-coded directory, because `TMPDIR` is caller-controlled. Kernel locks are released
+//! even when the helper is killed mid-PAM, so a hung attempt cannot wedge the slot.
 
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -98,7 +104,7 @@ fn attempt<T>(
         .write(true)
         .create(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
     {
         Ok(f) => f,
@@ -108,6 +114,25 @@ fn attempt<T>(
             return f();
         }
     };
+    // The name is predictable and /tmp is world-writable, so anyone can pre-create or
+    // replace the state file (a 0666 seed they then hold `flock` on, a FIFO, a device).
+    // Verify the opened handle like a config file and fail open on anything that is not a
+    // plain file owned by us (or root): a planted file must cost the throttle, never the
+    // unlock, and must never get to hold up - let alone refuse - an unlock attempt.
+    let md = match file.metadata() {
+        Ok(md) => md,
+        Err(e) => {
+            log::warn!("throttle: cannot stat {}: {e}; running unthrottled", path.display());
+            return f();
+        }
+    };
+    if let Some(why) = crate::config::untrusted_metadata(&md) {
+        log::warn!(
+            "throttle: {} not trusted ({why}); running unthrottled",
+            path.display()
+        );
+        return f();
+    }
 
     // Acquire the slot; the lock rides on `file` and is released when it is dropped, i.e.
     // after `f` returns, and at process exit even when the helper is killed mid-PAM.
@@ -227,6 +252,69 @@ mod tests {
         })
         .is_ok());
         assert!(ran.load(Ordering::SeqCst), "fail-open must run the attempt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A foreign-planted state file (0666, e.g. one an attacker holds `flock` on to forge
+    /// contention) must be bypassed: the attempt runs unthrottled and the planted file is
+    /// left untouched. On this platform the helper demonstrably waited a second and refused
+    /// before this check existed.
+    #[test]
+    fn planted_world_writable_state_file_fails_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = private_dir("planted");
+        let path = dir.join("state.lock");
+        std::fs::write(&path, b"planted\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran2 = Arc::clone(&ran);
+        let r = attempt(&path, MAX_WAIT, move || {
+            ran2.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        assert!(r.is_ok() && ran.load(Ordering::SeqCst), "planted file must not gate the attempt: {r:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"planted\n", "planted file must not be written");
+        // A 0600 file owned by us is the trusted case: the same attempt path records it.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(attempt(&path, MAX_WAIT, || Ok(()))
+            .and_then(|()| {
+                std::fs::read_to_string(&path)
+                    .map_err(|e| crate::lock::pam::PamError::System(e.to_string()))
+            })
+            .is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A planted FIFO must be refused (not regular) without ever blocking: `open` is
+    /// nonblocking and the fstat check rejects it before any read, so a hostile
+    /// /tmp/state-file cannot freeze the helper. Bounded like the config test.
+    #[test]
+    fn planted_fifo_fails_open_without_blocking() {
+        use std::ffi::CString;
+        use std::sync::mpsc;
+        let dir = private_dir("fifo");
+        let path = dir.join("state.lock");
+        let c = CString::new(path.to_string_lossy().into_owned()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path inside our private fixture directory;
+        // mkfifo only reads it.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo fixture");
+        let (tx, rx) = mpsc::channel();
+        let p = path.clone();
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran2 = Arc::clone(&ran);
+        std::thread::spawn(move || {
+            let _ = tx.send(attempt(&p, MAX_WAIT, move || {
+                ran2.store(true, Ordering::SeqCst);
+                Ok(())
+            }));
+        });
+        match rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap_or_else(|e| panic!("attempt blocked on a planted FIFO: {e}"))
+        {
+            Ok(()) => assert!(ran.load(Ordering::SeqCst), "fail-open must run the attempt"),
+            other => panic!("planted FIFO must not gate the attempt: {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
