@@ -350,12 +350,12 @@ pub fn resolve_pam_service(service: &str, dirs: &[PathBuf]) -> String {
     }
 }
 
-/// Reason a configuration file must not be trusted, or `None` if it is fine (or absent).
-/// Config can select the PAM service and disable locking, so it must be a regular file owned
-/// by us (or root) and not writable by group or others.
-pub(crate) fn untrusted_file(path: &std::path::Path) -> Option<String> {
+/// Reasons, shared by the path-based pre-check (`untrusted_file`) and the open-handle check
+/// in [`read_trusted`]: a configuration file must be a regular file owned by us (or root)
+/// and not writable by group or others, because config selects the PAM service and may
+/// disable locking.
+fn untrusted_metadata(md: &std::fs::Metadata) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
-    let md = std::fs::metadata(path).ok()?;
     // SAFETY: getuid has no preconditions and cannot fail.
     let me = unsafe { libc::getuid() };
     if !md.is_file() {
@@ -367,6 +367,41 @@ pub(crate) fn untrusted_file(path: &std::path::Path) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Reason a configuration file must not be trusted, or `None` if it is fine (or absent).
+/// Used by the helper-exec trust check in `lock::helper` (audit finding F1), which resolves
+/// a path it will exec and therefore cannot read through an opened handle. Not called on
+/// the library paths of this commit; the file-reading callers use [`read_trusted`].
+#[allow(dead_code)]
+pub(crate) fn untrusted_file(path: &std::path::Path) -> Option<String> {
+    let md = std::fs::metadata(path).ok()?;
+    untrusted_metadata(&md)
+}
+
+/// Read a configuration file without trusting the directory it sits in: the path is opened
+/// with `O_NOFOLLOW` (a symlinked path is refused, like the log file) and verified with
+/// `fstat` **on the opened handle**, so the trust check applies to the same inode the
+/// `read` pulls bytes from even under a concurrent rename or swap. `Ok(None)` if the path
+/// does not exist; `Err` with the failure reason as the message for every other problem.
+pub(crate) fn read_trusted(path: &std::path::Path) -> Result<Option<String>, std::io::Error> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if let Some(why) = untrusted_metadata(&f.metadata()?) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, why));
+    }
+    let mut s = String::new();
+    f.read_to_string(&mut s)?;
+    Ok(Some(s))
 }
 
 #[derive(Debug)]
@@ -424,6 +459,43 @@ mod tests {
         assert!(untrusted_file(&p).is_some());
         assert!(toml::load(&p).is_err(), "writable config must be refused, not applied");
         assert!(untrusted_file(&dir.join("missing")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_trusted_returns_absent_as_none() {
+        let p = std::env::temp_dir().join(format!("nightsaver-absent-{}.toml", std::process::id()));
+        assert_eq!(read_trusted(&p).unwrap(), None);
+    }
+
+    #[test]
+    fn symlinked_config_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("nightsaver-symlink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("real.toml");
+        std::fs::write(&target, "lock = true\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.join("link.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        // O_NOFOLLOW: the open fails instead of following the link. FreeBSD reports
+        // EMLINK ("Too many links"), Linux ELOOP; either means "a symlink was refused".
+        let err = read_trusted(&link).unwrap_err();
+        assert!(
+            matches!(err.raw_os_error(), Some(code) if code == libc::EMLINK || code == libc::ELOOP),
+            "symlink must be refused, got {err:?}"
+        );
+        // The real file still loads, read through its opened handle.
+        assert_eq!(read_trusted(&target).unwrap().as_deref(), Some("lock = true\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn directory_is_refused_as_not_regular() {
+        let dir = std::env::temp_dir().join(format!("nightsaver-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(untrusted_file(&dir).unwrap(), "not a regular file; ignored");
+        assert!(read_trusted(&dir).is_err(), "opening a directory must not return its bytes");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
