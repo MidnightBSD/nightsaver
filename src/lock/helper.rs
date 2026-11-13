@@ -43,6 +43,21 @@ pub fn helper_path() -> PathBuf {
     PathBuf::from(LIBEXEC_DIR).join(HELPER_NAME)
 }
 
+/// Refuse to exec a helper that is not a plain file owned by us (or root) and not writable
+/// by group or others: the helper's clean `exit(0)` is the only thing that unlocks, so a
+/// tampered or swapped helper would make the unlock dialog accept any password. A missing
+/// helper is not refused here; `Command::spawn` fails and that is a denial like any other
+/// system failure.
+fn trust_check(path: &std::path::Path) -> Result<(), PamError> {
+    if let Some(why) = crate::config::untrusted_file(path) {
+        return Err(PamError::System(format!(
+            "{HELPER_NAME}: refusing to run {}: {why}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Encode the request the helper reads from stdin.
 pub fn encode_request(service: &str, user: &str, password: &str) -> Zeroizing<Vec<u8>> {
     let mut v = Zeroizing::new(Vec::with_capacity(service.len() + user.len() + password.len() + 3));
@@ -96,6 +111,7 @@ pub fn authenticate(service: &str, user: &str, password: &Zeroizing<String>) -> 
         return Err(PamError::Denied("invalid input".into()));
     }
     let path = helper_path();
+    trust_check(&path)?;
     let mut child = Command::new(&path)
         .env_clear()
         .env("PATH", "/usr/bin:/bin:/usr/local/bin")
@@ -184,5 +200,22 @@ mod tests {
     fn helper_path_ends_with_name() {
         assert!(helper_path().ends_with(HELPER_NAME));
         assert!(std::path::Path::new(LIBEXEC_DIR).is_absolute());
+    }
+
+    #[test]
+    fn untrusted_helper_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("nightsaver-helper-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(HELPER_NAME);
+        std::fs::write(&p, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(trust_check(&p).is_ok(), "ours, 0600: must pass");
+        // Group/others writable: a swap by another local session must not be exec'd.
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(trust_check(&p).is_err(), "0o666 must be refused");
+        // A missing file is left to the spawn error (also a denial).
+        assert!(trust_check(&dir.join("missing")).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
