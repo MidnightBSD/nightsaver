@@ -462,17 +462,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Exclusive, private (0700) scratch directory for on-disk fixtures: created with the
+    /// mode itself (not created-then-chmodded), after clearing any leftover of an earlier
+    /// run, so no other local session can pre-plant files this test then writes into.
+    fn private_dir(tag: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let dir = std::env::temp_dir().join(format!("ns-config-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn read_trusted_returns_absent_as_none() {
-        let p = std::env::temp_dir().join(format!("nightsaver-absent-{}.toml", std::process::id()));
-        assert_eq!(read_trusted(&p).unwrap(), None);
+        let dir = private_dir("absent");
+        assert_eq!(read_trusted(&dir.join("absent.toml")).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn symlinked_config_is_refused() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("nightsaver-symlink-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = private_dir("symlink");
         let target = dir.join("real.toml");
         std::fs::write(&target, "lock = true\n").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -492,8 +503,7 @@ mod tests {
 
     #[test]
     fn directory_is_refused_as_not_regular() {
-        let dir = std::env::temp_dir().join(format!("nightsaver-dir-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = private_dir("dir");
         assert_eq!(untrusted_file(&dir).unwrap(), "not a regular file; ignored");
         assert!(read_trusted(&dir).is_err(), "opening a directory must not return its bytes");
         let _ = std::fs::remove_dir_all(&dir);
