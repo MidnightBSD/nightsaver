@@ -1174,9 +1174,14 @@ impl Daemon {
                 }
             }
             Command::Suspend => {
-                let r = if active { Ok(()) } else { self.activate(false) };
-                self.reply_after("suspending", r)?;
-                self.dpms_off();
+                if suspend_allowed(self.state, self.lock_pending) {
+                    let r = if active { Ok(()) } else { self.activate(false) };
+                    self.reply_after("suspending", r)?;
+                    self.dpms_off();
+                } else {
+                    log::warn!("SUSPEND refused: screen is locked or a lock is pending");
+                    self.respond(false, "screen is locked");
+                }
             }
             Command::Exit | Command::Restart => {
                 if self.state == SaverState::Locked || self.lock_pending {
@@ -1960,6 +1965,14 @@ fn pick_dialog(screens: &[(u32, u32, bool)]) -> usize {
         .map_or(0, |(i, _)| i)
 }
 
+/// SUSPEND may not power the display off while the user must authenticate or while a lock
+/// is pending (audit finding F4): the "NOT LOCKED" notice or the unlock dialog would vanish
+/// with the screen over the user's head. Same rule as EXIT/RESTART: locked or pending
+/// counts as locked.
+fn suspend_allowed(state: SaverState, lock_pending: bool) -> bool {
+    !(state == SaverState::Locked || lock_pending)
+}
+
 
 /// Short name of an event for trace logs (never formats key data).
 fn event_name(ev: &Event) -> &'static str {
@@ -2037,7 +2050,7 @@ pub fn demo_blank(display: Option<&str>) -> Result<(), Box<dyn std::error::Error
 
 #[cfg(test)]
 mod dialog_tests {
-    use super::pick_dialog;
+    use super::{SaverState, pick_dialog, suspend_allowed};
 
     #[test]
     fn primary_wins_only_when_big_enough() {
@@ -2046,5 +2059,14 @@ mod dialog_tests {
         assert_eq!(pick_dialog(&[(1920, 1080, false), (4, 4, true)]), 0);
         assert_eq!(pick_dialog(&[(100, 100, false), (200, 150, false)]), 1);
         assert_eq!(pick_dialog(&[]), 0);
+    }
+
+    #[test]
+    fn suspend_refused_while_locked_or_pending() {
+        assert!(suspend_allowed(SaverState::Idle, false));
+        assert!(suspend_allowed(SaverState::Blanked, false));
+        assert!(!suspend_allowed(SaverState::Blanked, true), "lock pending counts as locked");
+        assert!(!suspend_allowed(SaverState::Locked, false));
+        assert!(!suspend_allowed(SaverState::Locked, true));
     }
 }
