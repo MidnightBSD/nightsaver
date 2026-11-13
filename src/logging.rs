@@ -80,15 +80,18 @@ pub fn init(verbose: u8, log_file: Option<&Path>) -> Result<(), String> {
     Ok(())
 }
 
-/// Open (or create, mode 0600) the log file without following a symlink, and refuse a file
-/// that is not a regular file owned by us or that others could write: a pre-created link or
-/// world-writable file in a shared directory must not redirect or expose the log.
+/// Open (or create, mode 0600) the log file without following a symlink or blocking on a
+/// non-regular file, and refuse a file that is not a regular file owned by us or that
+/// others could write: a pre-created link or world-writable file in a shared directory
+/// must not redirect or expose the log. `O_NONBLOCK` makes a FIFO fail the open at once
+/// (`ENXIO`, no reader) instead of hanging startup forever; the handle's fstat rejects
+/// everything that is not a plain file before the logger ever writes to it.
 fn open_log_file(p: &Path) -> Result<File, String> {
     let f = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(p)
         .map_err(|e| format!("cannot open log file {}: {e}", p.display()))?;
     let md = f.metadata().map_err(|e| format!("cannot stat log file {}: {e}", p.display()))?;
@@ -124,5 +127,36 @@ mod tests {
         let t = timestamp();
         assert_eq!(t.len(), 10);
         assert!(t.starts_with('[') && t.ends_with(']'));
+    }
+
+    /// A FIFO at the log path must fail the open at once (`ENXIO`: writer-less FIFO with
+    /// `O_WRONLY|O_NONBLOCK`), never hang startup. The check runs on a thread with a
+    /// bounded wait so a regression fails loudly instead of wedging the test run.
+    #[test]
+    fn fifo_log_file_refused_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::fs::DirBuilderExt as _;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!("ns-logging-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let path = dir.join("nightsaver.log");
+        let c = CString::new(path.to_string_lossy().into_owned()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path inside our private fixture directory;
+        // mkfifo only reads it.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo fixture");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(open_log_file(&path));
+        });
+        match rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap_or_else(|e| panic!("open_log_file blocked on a FIFO (O_NONBLOCK missing?): {e}"))
+        {
+            Err(why) => assert!(why.contains("cannot open log file"), "{why}"),
+            Ok(_) => panic!("a writer-less FIFO must not open for writing"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
