@@ -353,8 +353,8 @@ pub fn resolve_pam_service(service: &str, dirs: &[PathBuf]) -> String {
 /// Reasons, shared by the path-based pre-check (`untrusted_file`) and the open-handle check
 /// in [`read_trusted`]: a configuration file must be a regular file owned by us (or root)
 /// and not writable by group or others, because config selects the PAM service and may
-/// disable locking.
-fn untrusted_metadata(md: &std::fs::Metadata) -> Option<String> {
+/// disable locking. Also used by `lock::throttle` to reject foreign-planted state files.
+pub(crate) fn untrusted_metadata(md: &std::fs::Metadata) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: getuid has no preconditions and cannot fail.
     let me = unsafe { libc::getuid() };
