@@ -3,10 +3,16 @@
 //! runs the PAM conversation in this short-lived single-threaded process, and exits 0 only on
 //! success. Not setuid; it authenticates the invoking user's own password through the
 //! system's PAM policy (e.g. unix-selfauth-helper). See `nightsaver::lock::helper`.
+//!
+//! PAM attempts are throttled per invoking user (`nightsaver::lock::throttle`): the helper
+//! is invocable by anyone, so the daemon-side dialog backoff is not the only protection PAM
+//! gets from a hammering loop. The throttle is advisory and fails open; contended slots are
+//! a refusal (a denial), never an unlock.
 use std::io::{IsTerminal, Read, Write};
 
 use nightsaver::lock::helper::{EXIT_DENIED, EXIT_OK, EXIT_SYSTEM, EXIT_USAGE, decode_request};
 use nightsaver::lock::pam::{self, PamError};
+use nightsaver::lock::throttle;
 use zeroize::Zeroizing;
 
 /// Upper bound on the request size (service + user + a 512-byte password, generously).
@@ -39,7 +45,7 @@ fn run() -> i32 {
     };
     drop(raw);
 
-    let result = pam::authenticate(&service, &user, &password);
+    let result = throttle::with_slot(|| pam::authenticate(&service, &user, &password));
     drop(password);
     let mut out = std::io::stdout();
     match result {

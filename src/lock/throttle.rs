@@ -1,0 +1,255 @@
+//! Advisory per-user throttle for `nightsaver-auth` PAM attempts. Owner: Opus E.
+//!
+//! The unlock dialog backs off after failures, but the helper is a plain executable any
+//! local process can run (`printf "xscreensaver\0me\0pw\0" | nightsaver-auth`), so nothing
+//! else stops a loop from hammering PAM: every attempt forks the setuid
+//! `unix-selfauth-helper` through `pam_exec`, whose crypt work is real CPU. The throttle
+//! serializes one invoking user's attempts on an fcntl lock for their whole attempt
+//! (including PAM, which also caps concurrency at one transaction per uid) and enforces a
+//! minimum gap between attempt starts, recorded in the state file.
+//!
+//! This is deliberately *advisory*: the state is a `/tmp` file that the invoking user could
+//! delete, rewrite or point at something else, and the invoking user could preload or patch
+//! their own copy of the helper. Any invocation with the correct password still went
+//! through a real PAM verify; a determined same-uid process is out of reach for every
+//! non-setuid helper (it already must never trust its environment). What the lock buys is
+//! protection from accidental loops and unpatched scripted abuse, and a bounded per-uid
+//! PAM load rather than an unbounded one.
+//!
+//! Failure directions:
+//! - Every problem opening, locking or reading the state file is **fail-open** (the attempt
+//!   runs unthrottled): the throttle may never stand between the user and unlocking, and a
+//!   broken state file must not turn into a lockout.
+//! - Only *contention* — another attempt of the same uid holding the slot longer than
+//!   `MAX_WAIT` — is a denial. That can only come from the user's own processes (the state
+//!   file is per-uid), so it cannot be used to lock out a different account.
+//!
+//! The state file is `/tmp/.nightsaver-auth-<uid>.lock` (0600, `O_NOFOLLOW`): a hard-coded
+//! directory, because `TMPDIR` is caller-controlled. Kernel locks are released even when
+//! the helper is killed mid-PAM, so a hung attempt cannot wedge the slot.
+
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use super::pam::PamError;
+
+/// Minimum gap between the starts of two PAM attempts of one user. Invisible for the lock
+/// dialog (its own backoff after a failure is at least one second) and tight enough to cap
+/// a looping caller's sustained rate at a handful of attempts per second.
+pub const MIN_GAP: Duration = Duration::from_millis(250);
+/// How long a process may wait for a same-uid attempt in flight to finish before the
+/// attempt is refused as throttled.
+pub const MAX_WAIT: Duration = Duration::from_secs(1);
+/// Poll step while waiting for the slot.
+const POLL: Duration = Duration::from_millis(25);
+/// `/tmp` is the only directory every unprivileged user can create a state file in.
+const STATE_DIR: &str = "/tmp";
+
+/// Refusal because another attempt of the same user holds the slot too long.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Contended;
+
+impl std::fmt::Display for Contended {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "throttled: another authentication for this user is in flight")
+    }
+}
+impl std::error::Error for Contended {}
+
+/// Default per-uid state file. `attempt` takes an explicit path; this is the shape the
+/// helper uses in production (hard-coded `/tmp` so `TMPDIR` cannot move it).
+fn lock_path() -> PathBuf {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    Path::new(STATE_DIR).join(format!(".nightsaver-auth-{uid}.lock"))
+}
+
+/// Milliseconds since the epoch (0 when the clock is before 1970, e.g. after a reset).
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Run one PAM attempt through the default per-uid throttle.
+///
+/// The helper calls this around `pam::authenticate`; `Ok` and error cases are passed
+/// through unchanged. Refusals come back as `Err(PamError::System(_))` with the
+/// [`Contended`] text, which every PAM system error already maps to a denial.
+pub fn with_slot<T>(
+    f: impl FnOnce() -> Result<T, PamError>,
+) -> Result<T, PamError> {
+    attempt(&lock_path(), MAX_WAIT, f)
+}
+
+/// The throttle mechanics for one attempt against the state file at `path`.
+fn attempt<T>(
+    path: &Path,
+    wait: Duration,
+    f: impl FnOnce() -> Result<T, PamError>,
+) -> Result<T, PamError> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            // Fail open: a broken or planted path may cost the throttle, never the unlock.
+            log::warn!("throttle: cannot open {}: {e}; running unthrottled", path.display());
+            return f();
+        }
+    };
+
+    // Acquire the slot; the lock rides on `file` and is released when it is dropped, i.e.
+    // after `f` returns, and at process exit even when the helper is killed mid-PAM.
+    let deadline = Instant::now().checked_add(wait).unwrap_or_else(Instant::now);
+    loop {
+        // SAFETY: advisory flock on the fd we just opened; only EAGAIN is expected.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            log::warn!("throttle: cannot lock {}: {err}; running unthrottled", path.display());
+            return f();
+        }
+        if Instant::now() >= deadline {
+            return Err(PamError::System(format!("{Contended} (waited {wait:?})")));
+        }
+        std::thread::sleep(POLL);
+    }
+
+    // Enforce the gap against the recorded last attempt start. A state file we cannot
+    // read or parse (never created, tampered with) counts as "long ago": run unimpeded.
+    let mut last = String::new();
+    let _ = (&file).take(32).read_to_string(&mut last);
+    let elapsed = Duration::from_millis(now_millis().saturating_sub(last.trim().parse().unwrap_or(0)));
+    if elapsed < MIN_GAP {
+        std::thread::sleep(MIN_GAP - elapsed);
+    }
+    // Record this attempt's start; a failed write must not block the attempt.
+    let _ = file.write_all_at(format!("{}\n", now_millis()).as_bytes(), 0);
+
+    f()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    /// Exclusive, private (0700) scratch directory for fixture state files: created with
+    /// the mode itself (not created-then-chmodded), after clearing any leftover of an
+    /// earlier run, so no other local session can pre-plant the fixture.
+    fn private_dir(tag: &str) -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let dir = std::env::temp_dir().join(format!("ns-throttle-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn lock_path_is_per_uid_in_tmp() {
+        let p = lock_path().to_string_lossy().into_owned();
+        assert!(p.starts_with("/tmp/.nightsaver-auth-"), "{p}");
+        assert!(p.ends_with(".lock"), "{p}");
+        // Different uids must not share a slot: the name carries the uid.
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        assert_eq!(p, format!("/tmp/.nightsaver-auth-{uid}.lock"));
+    }
+
+    #[test]
+    fn attempts_keep_the_minimum_gap_and_record_their_start() {
+        let dir = private_dir("gap");
+        let path = dir.join("state.lock");
+        let started = Instant::now();
+        attempt(&path, MAX_WAIT, || Ok(())).unwrap();
+        assert_eq!(attempt(&path, MAX_WAIT, || Ok(())), Ok(()));
+        // The first attempt set the timestamp; the second one waited out MIN_GAP.
+        assert!(started.elapsed() >= MIN_GAP, "gap not enforced");
+        // The state file now records a fresh attempt time.
+        let recorded = std::fs::read_to_string(&path).unwrap().trim().parse::<u64>().unwrap();
+        assert!(now_millis().saturating_sub(recorded) < 5_000, "stale record {recorded}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_taken_slot_refuses_the_attempt() {
+        let dir = private_dir("contended");
+        let path = dir.join("state.lock");
+        // Hold the slot the way another in-flight attempt would.
+        let held = File::create(&path).unwrap();
+        // SAFETY: advisory flock on the fixture fd we just created.
+        let rc = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) };
+        assert_eq!(rc, 0, "fixture must hold the lock");
+        let mut ok = false;
+        let r = attempt(&path, Duration::from_millis(60), || {
+            ok = true;
+            Ok(())
+        });
+        assert!(!ok, "refused attempt must not run");
+        assert!(matches!(&r, Err(PamError::System(m)) if m.contains("throttled")), "{r:?}");
+        drop(held);
+        // Once released, the same attempt goes through.
+        assert_eq!(attempt(&path, MAX_WAIT, || Ok(())), Ok(()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A broken state path (here: a symlink, which `O_NOFOLLOW` refuses to open) must let
+    /// the attempt run unthrottled.
+    #[test]
+    fn broken_state_file_fails_open() {
+        let dir = private_dir("failopen");
+        let path = dir.join("state.lock");
+        let target = dir.join("target");
+        std::fs::write(&target, b"x").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran2 = Arc::clone(&ran);
+        assert!(attempt(&path, MAX_WAIT, move || {
+            ran2.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .is_ok());
+        assert!(ran.load(Ordering::SeqCst), "fail-open must run the attempt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A state file with unparseable content counts as "long ago": run unimpeded.
+    #[test]
+    fn unreadable_timestamp_fails_open() {
+        let dir = private_dir("garbage");
+        let path = dir.join("state.lock");
+        std::fs::write(&path, "not a timestamp").unwrap();
+        assert!(attempt(&path, MAX_WAIT, || Ok(())).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn permissions_kept_private() {
+        let dir = private_dir("perm");
+        let path = dir.join("state.lock");
+        attempt(&path, MAX_WAIT, || Ok(())).unwrap();
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let me = unsafe { libc::getuid() };
+        let md = std::fs::metadata(&path).unwrap();
+        assert_eq!(md.mode() & 0o777, 0o600);
+        assert_eq!(MetadataExt::uid(&md), me);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
