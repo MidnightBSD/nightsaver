@@ -350,12 +350,12 @@ pub fn resolve_pam_service(service: &str, dirs: &[PathBuf]) -> String {
     }
 }
 
-/// Reason a configuration file must not be trusted, or `None` if it is fine (or absent).
-/// Config can select the PAM service and disable locking, so it must be a regular file owned
-/// by us (or root) and not writable by group or others.
-pub(crate) fn untrusted_file(path: &std::path::Path) -> Option<String> {
+/// Reasons, shared by the path-based pre-check (`untrusted_file`) and the open-handle check
+/// in [`read_trusted`]: a configuration file must be a regular file owned by us (or root)
+/// and not writable by group or others, because config selects the PAM service and may
+/// disable locking.
+fn untrusted_metadata(md: &std::fs::Metadata) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
-    let md = std::fs::metadata(path).ok()?;
     // SAFETY: getuid has no preconditions and cannot fail.
     let me = unsafe { libc::getuid() };
     if !md.is_file() {
@@ -367,6 +367,44 @@ pub(crate) fn untrusted_file(path: &std::path::Path) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Reason a configuration file must not be trusted, or `None` if it is fine (or absent).
+/// Used by the helper-exec trust check in `lock::helper` (audit finding F1), which resolves
+/// a path it will exec and therefore cannot read through an opened handle. Not called on
+/// the library paths of this commit; the file-reading callers use [`read_trusted`].
+#[allow(dead_code)]
+pub(crate) fn untrusted_file(path: &std::path::Path) -> Option<String> {
+    let md = std::fs::metadata(path).ok()?;
+    untrusted_metadata(&md)
+}
+
+/// Read a configuration file without trusting the directory it sits in: the path is opened
+/// with `O_NOFOLLOW` (a symlinked path is refused, like the log file) **and** `O_NONBLOCK`
+/// (a FIFO or device must never block the `open` — a plain open on a writer-less FIFO
+/// hangs forever, which a synchronous reload cannot afford), then verified with `fstat`
+/// **on the opened handle**, so the trust check applies to the same inode the `read`
+/// pulls bytes from even under a concurrent rename or swap, and rejects anything that is
+/// not a plain file before a byte is read. `Ok(None)` if the path does not exist; `Err`
+/// with the failure reason as the message for every other problem.
+pub(crate) fn read_trusted(path: &std::path::Path) -> Result<Option<String>, std::io::Error> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if let Some(why) = untrusted_metadata(&f.metadata()?) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, why));
+    }
+    let mut s = String::new();
+    f.read_to_string(&mut s)?;
+    Ok(Some(s))
 }
 
 #[derive(Debug)]
@@ -424,6 +462,86 @@ mod tests {
         assert!(untrusted_file(&p).is_some());
         assert!(toml::load(&p).is_err(), "writable config must be refused, not applied");
         assert!(untrusted_file(&dir.join("missing")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Exclusive, private (0700) scratch directory for on-disk fixtures: created with the
+    /// mode itself (not created-then-chmodded), after clearing any leftover of an earlier
+    /// run, so no other local session can pre-plant files this test then writes into.
+    fn private_dir(tag: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let dir = std::env::temp_dir().join(format!("ns-config-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn read_trusted_returns_absent_as_none() {
+        let dir = private_dir("absent");
+        assert_eq!(read_trusted(&dir.join("absent.toml")).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symlinked_config_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = private_dir("symlink");
+        let target = dir.join("real.toml");
+        std::fs::write(&target, "lock = true\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.join("link.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        // O_NOFOLLOW: the open fails instead of following the link. FreeBSD reports
+        // EMLINK ("Too many links"), Linux ELOOP; either means "a symlink was refused".
+        let err = read_trusted(&link).unwrap_err();
+        assert!(
+            matches!(err.raw_os_error(), Some(code) if code == libc::EMLINK || code == libc::ELOOP),
+            "symlink must be refused, got {err:?}"
+        );
+        // The real file still loads, read through its opened handle.
+        assert_eq!(read_trusted(&target).unwrap().as_deref(), Some("lock = true\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn directory_is_refused_as_not_regular() {
+        let dir = private_dir("dir");
+        assert_eq!(untrusted_file(&dir).unwrap(), "not a regular file; ignored");
+        assert!(read_trusted(&dir).is_err(), "opening a directory must not return its bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A FIFO at the path must be refused without ever blocking: `open` on a writer-less
+    /// FIFO hangs forever, and a blocking `read_trusted` would freeze a synchronous config
+    /// reload even while the screen is locked. The check runs on a thread with a bounded
+    /// wait so a regression fails loudly instead of hanging the test run.
+    #[test]
+    fn fifo_config_is_refused_without_blocking() {
+        use std::ffi::CString;
+        use std::sync::mpsc;
+        let dir = private_dir("fifo");
+        let path = dir.join("config.toml");
+        let c = CString::new(path.to_string_lossy().into_owned()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path inside our private fixture directory;
+        // mkfifo only reads it.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo fixture");
+        let (tx, rx) = mpsc::channel();
+        let p = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_trusted(&p));
+        });
+        match rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap_or_else(|e| panic!("read_trusted blocked on a FIFO (O_NONBLOCK missing?): {e}"))
+        {
+            Err(err) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err:?}");
+                assert!(err.to_string().contains("not a regular file"), "{err}");
+            }
+            Ok(Some(bytes)) => panic!("read a FIFO's bytes: {bytes:?}"),
+            Ok(None) => panic!("a FIFO reported as absent"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

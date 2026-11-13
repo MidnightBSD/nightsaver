@@ -94,16 +94,14 @@ pub fn parse_str(s: &str) -> Result<TomlConfig, ConfigError> {
 
 /// Load a config file; `Ok(None)` if it does not exist.
 pub fn load(path: &Path) -> Result<Option<TomlConfig>, ConfigError> {
-    if let Some(why) = super::untrusted_file(path) {
-        return Err(ConfigError::Parse(format!("{}: {why}", path.display())));
-    }
-    match std::fs::read_to_string(path) {
-        Ok(s) => parse_str(&s)
-            .map(Some)
-            .map_err(|e| ConfigError::Parse(format!("{}: {e}", path.display()))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(ConfigError::Io(e)),
-    }
+    let text = match super::read_trusted(path) {
+        Ok(None) => return Ok(None),
+        Ok(Some(s)) => s,
+        Err(e) => return Err(ConfigError::Parse(format!("{}: {e}", path.display()))),
+    };
+    parse_str(&text)
+        .map(Some)
+        .map_err(|e| ConfigError::Parse(format!("{}: {e}", path.display())))
 }
 
 /// `$XDG_CONFIG_HOME/nightsaver/config.toml`, else `$HOME/.config/nightsaver/config.toml`.
