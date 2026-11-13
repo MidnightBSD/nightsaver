@@ -10,6 +10,7 @@
 //! the locker down; the helper is killed after `helper::HELPER_TIMEOUT`.
 pub mod helper;
 pub mod pam;
+pub mod throttle;
 pub mod ui;
 
 use std::sync::{Arc, OnceLock};
