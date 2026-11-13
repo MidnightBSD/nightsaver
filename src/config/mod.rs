@@ -380,16 +380,19 @@ pub(crate) fn untrusted_file(path: &std::path::Path) -> Option<String> {
 }
 
 /// Read a configuration file without trusting the directory it sits in: the path is opened
-/// with `O_NOFOLLOW` (a symlinked path is refused, like the log file) and verified with
-/// `fstat` **on the opened handle**, so the trust check applies to the same inode the
-/// `read` pulls bytes from even under a concurrent rename or swap. `Ok(None)` if the path
-/// does not exist; `Err` with the failure reason as the message for every other problem.
+/// with `O_NOFOLLOW` (a symlinked path is refused, like the log file) **and** `O_NONBLOCK`
+/// (a FIFO or device must never block the `open` — a plain open on a writer-less FIFO
+/// hangs forever, which a synchronous reload cannot afford), then verified with `fstat`
+/// **on the opened handle**, so the trust check applies to the same inode the `read`
+/// pulls bytes from even under a concurrent rename or swap, and rejects anything that is
+/// not a plain file before a byte is read. `Ok(None)` if the path does not exist; `Err`
+/// with the failure reason as the message for every other problem.
 pub(crate) fn read_trusted(path: &std::path::Path) -> Result<Option<String>, std::io::Error> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
     {
         Ok(f) => f,
@@ -506,6 +509,39 @@ mod tests {
         let dir = private_dir("dir");
         assert_eq!(untrusted_file(&dir).unwrap(), "not a regular file; ignored");
         assert!(read_trusted(&dir).is_err(), "opening a directory must not return its bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A FIFO at the path must be refused without ever blocking: `open` on a writer-less
+    /// FIFO hangs forever, and a blocking `read_trusted` would freeze a synchronous config
+    /// reload even while the screen is locked. The check runs on a thread with a bounded
+    /// wait so a regression fails loudly instead of hanging the test run.
+    #[test]
+    fn fifo_config_is_refused_without_blocking() {
+        use std::ffi::CString;
+        use std::sync::mpsc;
+        let dir = private_dir("fifo");
+        let path = dir.join("config.toml");
+        let c = CString::new(path.to_string_lossy().into_owned()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path inside our private fixture directory;
+        // mkfifo only reads it.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo fixture");
+        let (tx, rx) = mpsc::channel();
+        let p = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_trusted(&p));
+        });
+        match rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap_or_else(|e| panic!("read_trusted blocked on a FIFO (O_NONBLOCK missing?): {e}"))
+        {
+            Err(err) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err:?}");
+                assert!(err.to_string().contains("not a regular file"), "{err}");
+            }
+            Ok(Some(bytes)) => panic!("read a FIFO's bytes: {bytes:?}"),
+            Ok(None) => panic!("a FIFO reported as absent"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
