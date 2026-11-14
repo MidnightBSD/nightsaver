@@ -58,6 +58,8 @@ pub struct TomlOled {
 #[serde(default)]
 pub struct TomlConfig {
     pub display: Option<String>,
+    /// One of `auto`, `x11`, `wayland`.
+    pub backend: Option<String>,
     pub verbose: Option<u8>,
     pub log_file: Option<PathBuf>,
     pub splash: Option<bool>,
@@ -88,6 +90,11 @@ pub fn parse_str(s: &str) -> Result<TomlConfig, ConfigError> {
         && !matches!(m.to_ascii_lowercase().as_str(), "one" | "random" | "random-same" | "blank" | "off")
     {
         return Err(ConfigError::Parse(format!("invalid mode {m:?} (one|random|blank|off)")));
+    }
+    if let Some(b) = &c.backend
+        && super::Backend::parse(b).is_none()
+    {
+        return Err(ConfigError::Parse(format!("invalid backend {b:?} (auto|x11|wayland)")));
     }
     Ok(c)
 }

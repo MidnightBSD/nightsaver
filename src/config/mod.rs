@@ -52,9 +52,58 @@ pub struct OledConfig {
     pub lit_budget: f32,
 }
 
+/// Which display system the daemon talks to (`backend` key, `--backend`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backend {
+    /// Wayland when `WAYLAND_DISPLAY` is set, else X11.
+    #[default]
+    Auto,
+    X11,
+    Wayland,
+}
+
+impl Backend {
+    /// Parse a configured name; `None` for anything but `auto`, `x11` or `wayland`.
+    pub fn parse(s: &str) -> Option<Backend> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Backend::Auto),
+            "x11" | "xorg" => Some(Backend::X11),
+            "wayland" => Some(Backend::Wayland),
+            _ => None,
+        }
+    }
+}
+
+/// The backend the daemon will actually use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedBackend {
+    /// X11. `lockable` is false when a Wayland session is running: the X server is then
+    /// XWayland, where grabs do not reach native Wayland clients, so a "lock" would leave
+    /// them usable while the status said LOCK.
+    X11 { lockable: bool },
+    Wayland,
+}
+
+/// Decide the backend from the configured choice and whether a Wayland session is running
+/// (`WAYLAND_DISPLAY` set and not empty).
+pub fn resolve_backend(requested: Backend, wayland_session: bool) -> ResolvedBackend {
+    match requested {
+        Backend::Wayland => ResolvedBackend::Wayland,
+        Backend::Auto if wayland_session => ResolvedBackend::Wayland,
+        Backend::Auto => ResolvedBackend::X11 { lockable: true },
+        Backend::X11 => ResolvedBackend::X11 { lockable: !wayland_session },
+    }
+}
+
+/// True if the environment names a Wayland session.
+pub fn wayland_session() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub display: Option<String>,
+    pub backend: Backend,
     pub verbose: u8,
     pub log_file: Option<PathBuf>,
     pub splash: bool,
@@ -84,6 +133,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             display: None,
+            backend: Backend::Auto,
             verbose: 0,
             log_file: None,
             splash: false,
@@ -133,6 +183,11 @@ impl Config {
                 std::io::ErrorKind::NotFound,
                 format!("config file {} not found", p.display()),
             )));
+        }
+        if let Some(b) = &cli.backend
+            && Backend::parse(b).is_none()
+        {
+            return Err(ConfigError::Parse(format!("invalid --backend {b:?} (auto|x11|wayland)")));
         }
         Ok(Config::load_from(cli, xres, t))
     }
@@ -202,6 +257,10 @@ impl Config {
         if t.display.is_some() {
             self.display = t.display;
         }
+        // Validated by `toml::parse_str`.
+        if let Some(b) = t.backend.as_deref().and_then(Backend::parse) {
+            self.backend = b;
+        }
         s!(self.verbose, t.verbose);
         if t.log_file.is_some() {
             self.log_file = t.log_file;
@@ -247,6 +306,10 @@ impl Config {
     fn overlay_cli(&mut self, a: &crate::cli::Args) {
         if a.display.is_some() {
             self.display = a.display.clone();
+        }
+        // An invalid name is rejected by `load`; here it is simply not applied.
+        if let Some(b) = a.backend.as_deref().and_then(Backend::parse) {
+            self.backend = b;
         }
         if a.quiet {
             self.verbose = 0;
@@ -425,6 +488,42 @@ impl std::error::Error for ConfigError {}
 #[cfg(test)]
 mod tests {
     use super::xresources::{Program, XMode, XResources};
+
+    #[test]
+    fn backend_names_parse() {
+        use super::Backend;
+        assert_eq!(Backend::parse("auto"), Some(Backend::Auto));
+        assert_eq!(Backend::parse(" X11 "), Some(Backend::X11));
+        assert_eq!(Backend::parse("xorg"), Some(Backend::X11));
+        assert_eq!(Backend::parse("Wayland"), Some(Backend::Wayland));
+        assert_eq!(Backend::parse("mir"), None);
+        assert_eq!(Backend::parse(""), None);
+    }
+
+    /// The one rule that matters: with a Wayland session running, X11 is never lockable,
+    /// and `auto` never silently picks X11 (XWayland).
+    #[test]
+    fn backend_resolution_never_locks_xwayland() {
+        use super::{Backend, ResolvedBackend, resolve_backend};
+        let x11 = |lockable| ResolvedBackend::X11 { lockable };
+        assert_eq!(resolve_backend(Backend::Auto, false), x11(true));
+        assert_eq!(resolve_backend(Backend::Auto, true), ResolvedBackend::Wayland);
+        assert_eq!(resolve_backend(Backend::X11, false), x11(true));
+        assert_eq!(resolve_backend(Backend::X11, true), x11(false));
+        assert_eq!(resolve_backend(Backend::Wayland, false), ResolvedBackend::Wayland);
+        assert_eq!(resolve_backend(Backend::Wayland, true), ResolvedBackend::Wayland);
+    }
+
+    #[test]
+    fn backend_merges_toml_then_cli() {
+        use super::{Backend, Config, toml};
+        let args = |b: Option<&str>| crate::cli::Args { backend: b.map(str::to_owned), ..Default::default() };
+        let t = || Some(toml::parse_str("backend = \"x11\"").unwrap());
+        assert_eq!(Config::load_from(&args(None), None, None).backend, Backend::Auto);
+        assert_eq!(Config::load_from(&args(None), None, t()).backend, Backend::X11);
+        assert_eq!(Config::load_from(&args(Some("wayland")), None, t()).backend, Backend::Wayland);
+        assert!(toml::parse_str("backend = \"mir\"").is_err());
+    }
 
     #[test]
     fn pam_service_with_path_characters_is_rejected() {

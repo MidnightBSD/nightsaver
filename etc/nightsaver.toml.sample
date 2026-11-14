@@ -9,6 +9,11 @@
 # X display to manage (default: $DISPLAY).
 # display = ":0"
 
+# Display system: "auto" (Wayland when WAYLAND_DISPLAY is set, else X11), "x11" or
+# "wayland". There is no Wayland backend yet; "x11" in a Wayland session runs on
+# XWayland and never locks.
+# backend = "auto"
+
 # Log verbosity: 0 = warnings, 1 = info, 2 = debug, 3+ = trace.
 # verbose = 0
 

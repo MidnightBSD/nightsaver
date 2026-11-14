@@ -64,6 +64,18 @@ Negative values are rejected.
 .Bl -tag -width indent
 .It Va display No (string, default Dv $DISPLAY )
 X display to manage.
+.It Va backend No (string, default Qq auto )
+Display system:
+.Qq auto ,
+.Qq x11
+or
+.Qq wayland .
+See
+.Fl Fl backend
+in
+.Xr nightsaver 1 .
+Any other value is an error.
+Not changed by a reload.
 .It Va verbose No (integer, default 0)
 Log verbosity: 0 warnings, 1 info, 2 debug, 3 and above trace.
 .It Va log_file No (string, default none)

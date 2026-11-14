@@ -16,6 +16,7 @@
 .Op Fl Fl lock | Fl Fl no-lock
 .Op Fl Fl config Ar file
 .Op Fl Fl pattern Ar name
+.Op Fl Fl backend Cm auto | x11 | wayland
 .Nm
 .Fl version
 .Sh DESCRIPTION
@@ -59,6 +60,21 @@ and
 The X display to manage.
 The default is
 .Ev DISPLAY .
+.It Fl Fl backend Cm auto | x11 | wayland
+The display system to use.
+.Cm auto ,
+the default, selects Wayland when
+.Ev WAYLAND_DISPLAY
+is set and X11 otherwise.
+There is no Wayland backend yet, so selecting it makes
+.Nm
+exit with an error.
+.Cm x11
+in a Wayland session runs on XWayland with locking disabled: the screen is
+blanked, but
+.Nm
+never locks and never reports a lock, because X grabs do not reach native
+Wayland clients.
 .It Fl verbose
 Also
 .Fl v .
@@ -330,7 +346,12 @@ left logged in.
 .Sh AUTHORS
 .An Lucas Holt
 .Sh BUGS
-Only Xorg is supported; there is no Wayland support.
+Only Xorg is supported; there is no Wayland backend yet.
+In a Wayland session
+.Nm
+refuses to start unless
+.Fl Fl backend Cm x11
+is given, and then it cannot lock.
 Running xscreensaver hack programs, the xscreensaver settings dialog, fading
 (the
 .Va fade
