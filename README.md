@@ -89,7 +89,7 @@ timeout = "0:05:00"        # idle time before blanking
 lock = true                # require a password
 lock_timeout = "0:00:30"   # lock this long after blanking
 mode = "random"            # one | random | blank | off
-patterns = ["clock", "starfield", "matrix", "midnight", "cat", "juggler", "puppy"]
+patterns = ["clock", "starfield", "matrix", "midnight", "cat", "juggler", "puppy", "penguin"]
 
 [dpms]
 enabled = true
@@ -140,9 +140,10 @@ reachable, 1 for usage errors. `-demo` is parsed but answered with "not supporte
 | `cat`       | An ASCII-art cat that blinks, swishes its tail, naps with floating z's and watches the odd mouse go by (aliases `asciicat`, `kitty`). |
 | `juggler`   | An ASCII-art stick figure juggling a three-ball cascade on smooth arcs (alias `juggle`). |
 | `puppy`     | An ASCII-art puppy that wags its tail, pants, barks, gets excited when a ball bounces past and naps with floating z's (aliases `dog`, `puppydog`). |
+| `penguin`   | An ASCII-art penguin that waddles back and forth in light snow, flaps its flippers, perks up when a fish leaps past and naps standing up (alias `penguins`). |
 
 `-select N` and `-next`/`-prev` index the configured `patterns` list. The default list is
-`clock`, `starfield`, `matrix`, `midnight`, `cat`, `juggler`, `puppy`; `blank` is available by name or via `mode = "blank"`.
+`clock`, `starfield`, `matrix`, `midnight`, `cat`, `juggler`, `puppy`, `penguin`; `blank` is available by name or via `mode = "blank"`.
 
 ## OLED design notes
 
