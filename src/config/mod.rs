@@ -380,19 +380,20 @@ pub(crate) fn untrusted_file(path: &std::path::Path) -> Option<String> {
 }
 
 /// Read a configuration file without trusting the directory it sits in: the path is opened
-/// with `O_NOFOLLOW` (a symlinked path is refused, like the log file) **and** `O_NONBLOCK`
-/// (a FIFO or device must never block the `open` — a plain open on a writer-less FIFO
-/// hangs forever, which a synchronous reload cannot afford), then verified with `fstat`
-/// **on the opened handle**, so the trust check applies to the same inode the `read`
-/// pulls bytes from even under a concurrent rename or swap, and rejects anything that is
-/// not a plain file before a byte is read. `Ok(None)` if the path does not exist; `Err`
+/// with `O_NONBLOCK` (a FIFO or device must never block the `open` — a plain open on a
+/// writer-less FIFO hangs forever, which a synchronous reload cannot afford), then verified
+/// with `fstat` **on the opened handle**, so the trust check applies to the same inode the
+/// `read` pulls bytes from even under a concurrent rename or swap, and rejects anything
+/// that is not a plain file before a byte is read. A symlink is followed on purpose
+/// (dotfile managers link `~/.xscreensaver` and the TOML file into place); the rules then
+/// apply to the file it resolves to, which is the one that is read. `Ok(None)` if the path does not exist; `Err`
 /// with the failure reason as the message for every other problem.
 pub(crate) fn read_trusted(path: &std::path::Path) -> Result<Option<String>, std::io::Error> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NONBLOCK)
         .open(path)
     {
         Ok(f) => f,
@@ -483,8 +484,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A symlinked config (dotfile managers) is followed, and the trust rules apply to the
+    /// file it resolves to: a good target loads, a group/others-writable one is refused.
     #[test]
-    fn symlinked_config_is_refused() {
+    fn symlinked_config_is_followed_and_its_target_checked() {
         use std::os::unix::fs::PermissionsExt;
         let dir = private_dir("symlink");
         let target = dir.join("real.toml");
@@ -492,15 +495,13 @@ mod tests {
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
         let link = dir.join("link.toml");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        // O_NOFOLLOW: the open fails instead of following the link. FreeBSD reports
-        // EMLINK ("Too many links"), Linux ELOOP; either means "a symlink was refused".
+        assert_eq!(read_trusted(&link).unwrap().as_deref(), Some("lock = true\n"));
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o666)).unwrap();
         let err = read_trusted(&link).unwrap_err();
-        assert!(
-            matches!(err.raw_os_error(), Some(code) if code == libc::EMLINK || code == libc::ELOOP),
-            "symlink must be refused, got {err:?}"
-        );
-        // The real file still loads, read through its opened handle.
-        assert_eq!(read_trusted(&target).unwrap().as_deref(), Some("lock = true\n"));
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err:?}");
+        // A dangling link is a missing config, not an error.
+        std::fs::remove_file(&target).unwrap();
+        assert_eq!(read_trusted(&link).unwrap(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
