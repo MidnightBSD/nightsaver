@@ -37,6 +37,7 @@ use crate::patterns::{self, Pattern, Rng};
 use crate::render::Framebuffer;
 use crate::render::oled::OledGuard;
 use crate::display::{Backend, DisplayEvent, Monitor, SurfaceId};
+use crate::wayland::WaylandBackend;
 use crate::x11::backend::X11Backend;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,6 +216,11 @@ struct Daemon {
     screens: Vec<Screen>,
     /// The backend holds exclusive input (keyboard and pointer), as far as we know.
     grabbed: bool,
+    /// The exclusive input held is good enough to lock with (always, where the backend
+    /// has only one kind; on Wayland only once the compositor confirmed a session lock).
+    grab_secure: bool,
+    /// `Capabilities::lock_is_separate`.
+    lock_is_separate: bool,
     /// A lock was requested (LOCK command or lock timeout) but the grab is not held yet.
     lock_pending: bool,
     /// Index into `cfg.patterns` of the running pattern (`None` for blank mode).
@@ -260,30 +266,12 @@ struct Daemon {
     reply_to: Option<control::Client>,
 }
 
-/// Refusal when the Wayland backend is selected: there is none yet, and silently falling
-/// back to XWayland would blank and claim a lock that native Wayland clients ignore.
-const WAYLAND_UNSUPPORTED: &str = "Wayland is not supported yet; use --backend x11 to run on \
-     XWayland (it can blank the screen but cannot lock native Wayland clients)";
+/// `--demo-blank` is an X11 debugging aid.
+const DEMO_NEEDS_X11: &str = "--demo-blank only works on an Xorg display, not in a Wayland session";
 
 /// Run the daemon until EXIT (returns Ok) or a fatal X error. RESTART re-execs and only
 /// returns on failure.
 pub fn run(args: Args, cfg: Config) -> Result<(), Box<dyn Error>> {
-    let lockable = match resolve_backend(cfg.backend, wayland_session()) {
-        ResolvedBackend::Wayland => return Err(WAYLAND_UNSUPPORTED.into()),
-        ResolvedBackend::X11 { lockable } => lockable,
-    };
-    if !lockable {
-        log::warn!(
-            "WAYLAND_DISPLAY is set: this X server is XWayland, which cannot lock native \
-             Wayland clients; locking is disabled and the screen will only be blanked"
-        );
-    }
-    let display_name = cfg
-        .display
-        .clone()
-        .or_else(|| std::env::var("DISPLAY").ok())
-        .unwrap_or_default();
-
     install_signal_handlers();
     install_panic_hook();
     let user = lockapi::current_username().or_else(|| {
@@ -292,13 +280,41 @@ pub fn run(args: Args, cfg: Config) -> Result<(), Box<dyn Error>> {
             .flatten()
             .map(|u| u.name)
     });
-    let backend: Box<dyn Backend> = Box::new(X11Backend::open(
-        cfg.display.as_deref(),
-        &display_name,
-        user.as_deref(),
-        cfg.lock,
-        lockable,
-    )?);
+    let (backend, display_name): (Box<dyn Backend>, String) =
+        match resolve_backend(cfg.backend, wayland_session()) {
+            ResolvedBackend::Wayland => {
+                let name = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".into());
+                // The control socket is the only place a running daemon can be seen here
+                // (X has the rendezvous window for this).
+                if control::daemon_listening(&name) {
+                    eprintln!("{PROGNAME}: already running on display {name}");
+                    std::process::exit(1);
+                }
+                (Box::new(WaylandBackend::open(cfg.lock)?), name)
+            }
+            ResolvedBackend::X11 { lockable } => {
+                if !lockable {
+                    log::warn!(
+                        "WAYLAND_DISPLAY is set: this X server is XWayland, which cannot lock \
+                         native Wayland clients; locking is disabled and the screen will only \
+                         be blanked"
+                    );
+                }
+                let name = cfg
+                    .display
+                    .clone()
+                    .or_else(|| std::env::var("DISPLAY").ok())
+                    .unwrap_or_default();
+                let backend = X11Backend::open(
+                    cfg.display.as_deref(),
+                    &name,
+                    user.as_deref(),
+                    cfg.lock,
+                    lockable,
+                )?;
+                (Box::new(backend), name)
+            }
+        };
     let caps = backend.capabilities();
     let control = match ControlServer::bind(&display_name) {
         Ok(c) => {
@@ -340,6 +356,8 @@ pub fn run(args: Args, cfg: Config) -> Result<(), Box<dyn Error>> {
         state: SaverState::Idle,
         screens: Vec::new(),
         grabbed: false,
+        grab_secure: false,
+        lock_is_separate: caps.lock_is_separate,
         lock_pending: false,
         current: None,
         rng: Rng::new(time_seed()),
@@ -408,7 +426,15 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         // Best-effort teardown; the backend withdraws our identity and status and closes
         // the connection when it is dropped right after this.
-        self.teardown_windows();
+        //
+        // Not while locked or while a lock is pending (we only get here then when the
+        // display connection died or the process is unwinding): teardown releases exclusive
+        // input, which on Wayland is what unlocks the session. Closing the connection
+        // without it leaves the compositor's session lock in place, and on X the server
+        // removes our windows and grabs either way.
+        if self.state != SaverState::Locked && !self.lock_pending {
+            self.teardown_windows();
+        }
         self.restore_dpms();
     }
 }
@@ -507,7 +533,7 @@ impl Daemon {
     /// connection (where the server has already removed our windows) is fatal.
     fn recoverable(&self, e: Box<dyn Error>) -> Result<(), Box<dyn Error>> {
         if let Err(conn) = self.backend.check_connection() {
-            log::error!("X connection lost ({e}; {conn})");
+            log::error!("display connection lost ({e}; {conn})");
             return Err(e);
         }
         log::error!("{e} (state {:?}); continuing", self.state);
@@ -921,7 +947,7 @@ impl Daemon {
                 if self.state == SaverState::Locked {
                     self.respond(false, "already locked");
                 } else if !self.can_lock() {
-                    self.respond(false, "locking is not possible on XWayland");
+                    self.respond(false, "locking is not supported on this display");
                 } else {
                     // Reply only once the outcome is known: "+locking" means Locked, which in
                     // turn means both grabs are held. Otherwise the lock stays pending (status
@@ -937,7 +963,12 @@ impl Daemon {
                     } else if self.state == SaverState::Locked {
                         self.respond(true, "locking");
                     } else {
-                        self.respond(false, "unable to grab keyboard");
+                        let why = if self.lock_is_separate {
+                            "unable to lock the session"
+                        } else {
+                            "unable to grab keyboard"
+                        };
+                        self.respond(false, why);
                     }
                 }
             }
@@ -1006,7 +1037,7 @@ impl Daemon {
         self.current = pattern;
         self.grabbed = false;
         self.lock_pending = false;
-        self.try_grab(GRAB_TIMEOUT);
+        self.try_grab(GRAB_TIMEOUT, false);
 
         // Decide the lock state now that the windows are mapped and the grab attempted, before
         // any fallible rendering setup.
@@ -1042,23 +1073,31 @@ impl Daemon {
         Ok(())
     }
 
-    /// Try to take exclusive keyboard+pointer input. On failure schedule a retry.
-    fn try_grab(&mut self, timeout: Duration) {
+    /// Try to take exclusive keyboard+pointer input. On failure schedule a retry. Once a
+    /// lock is wanted (locked, pending, or `for_lock`) only lock-grade input counts.
+    fn try_grab(&mut self, timeout: Duration, for_lock: bool) {
         if self.state == SaverState::Idle {
             return;
         }
+        let for_lock = for_lock || self.state == SaverState::Locked || self.lock_pending;
         let now = Instant::now();
-        match self.backend.acquire_exclusive(timeout) {
+        match self.backend.acquire_exclusive(timeout, for_lock) {
             Ok(()) => {
                 if !self.grabbed {
-                    log::debug!("keyboard and pointer grabbed");
+                    if self.lock_is_separate {
+                        log::debug!("exclusive input held ({})", if for_lock { "session lock" } else { "saver surfaces" });
+                    } else {
+                        log::debug!("keyboard and pointer grabbed");
+                    }
                 }
                 self.grabbed = true;
+                self.grab_secure = for_lock || !self.lock_is_separate;
                 self.next_grab_retry = None;
                 self.next_grab_reassert = Some(later(now, GRAB_REASSERT));
             }
             Err(e) => {
                 self.grabbed = false;
+                self.grab_secure = false;
                 self.next_grab_reassert = None;
                 if self.next_grab_retry.is_none() {
                     if self.state == SaverState::Locked || self.lock_pending {
@@ -1073,7 +1112,7 @@ impl Daemon {
     }
 
     fn retry_grab(&mut self) {
-        self.try_grab(Duration::from_millis(100));
+        self.try_grab(Duration::from_millis(100), false);
         if self.grabbed {
             log::info!("grab acquired");
             if self.lock_pending {
@@ -1113,7 +1152,7 @@ impl Daemon {
         self.next_grab_reassert = None;
         self.hide_prompt();
         self.backend.restore_cover();
-        self.try_grab(Duration::from_millis(200));
+        self.try_grab(Duration::from_millis(200), false);
         if self.grabbed {
             log::info!("grab re-acquired");
             if self.lock_pending {
@@ -1222,7 +1261,7 @@ impl Daemon {
         if !self.lockable {
             // Single choke point: whatever asked for the lock (command, lock timeout,
             // --lock), an XWayland display is never reported as locked.
-            log::warn!("lock requested, but this display cannot be locked (XWayland): staying blanked");
+            log::warn!("lock requested, but this display cannot be locked: staying blanked");
             self.lock_deadline = None;
             return false;
         }
@@ -1230,10 +1269,12 @@ impl Daemon {
             // The lookup failed at startup (NIS/LDAP outage?); try once more now.
             self.user = lockapi::current_username();
         }
-        if !self.grabbed {
-            self.try_grab(Duration::from_millis(500));
+        if !(self.grabbed && self.grab_secure) {
+            self.try_grab(Duration::from_millis(500), true);
         }
-        if !self.grabbed {
+        if !(self.grabbed && self.grab_secure) {
+            // Input that is not lock-grade does not count as held from here on.
+            self.grabbed = false;
             if !self.lock_pending {
                 log::warn!(
                     "cannot grab keyboard and pointer: lock pending, staying blanked until the grab succeeds"
@@ -1330,7 +1371,7 @@ impl Daemon {
                 Err(e) => self.grab_lost(&format!("re-grab after relayout failed: {e}")),
             }
         } else {
-            self.try_grab(Duration::from_millis(500));
+            self.try_grab(Duration::from_millis(500), false);
             if self.grabbed && self.lock_pending {
                 self.lock_now();
             }
@@ -1428,6 +1469,11 @@ impl Daemon {
         let dialog_on = dialog_screen(&self.screens);
         let show_dialog = self.state == SaverState::Locked && self.grabbed;
         let not_locked = self.lock_pending && !self.grabbed;
+        let not_locked_text = if self.lock_is_separate {
+            "NOT LOCKED: the compositor has not locked the session"
+        } else {
+            "NOT LOCKED: another program holds the keyboard or mouse"
+        };
         let no_keyboard = !self.backend.has_keyboard();
         let dark = self.dark();
         for (i, s) in self.screens.iter_mut().enumerate() {
@@ -1452,7 +1498,7 @@ impl Daemon {
             if not_locked {
                 // Never let a black screen pass for a lock: another client holds a grab and
                 // keystrokes may reach it.
-                draw_notice(&mut s.fb, "NOT LOCKED: another program holds the keyboard or mouse", now);
+                draw_notice(&mut s.fb, not_locked_text, now);
             }
             self.backend.present(s.surface, &s.fb)?;
         }
@@ -1663,7 +1709,7 @@ fn suspend_allowed(state: SaverState, lock_pending: bool) -> bool {
 /// `--demo-blank` (debug): black windows on every monitor for 3 seconds, then exit.
 pub fn demo_blank(display: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     if wayland_session() {
-        return Err(WAYLAND_UNSUPPORTED.into());
+        return Err(DEMO_NEEDS_X11.into());
     }
     crate::x11::backend::demo_blank(display)
 }

@@ -4,7 +4,7 @@ version = "0.6.0"
 edition = "2024"
 rust-version = "1.96"
 license = "BSD-2-Clause"
-description = "OLED-friendly Xorg screensaver and PAM screen locker, xscreensaver drop-in"
+description = "OLED-friendly screensaver and PAM screen locker for Xorg and Wayland, xscreensaver drop-in"
 repository = "https://github.com/MidnightBSD/nightsaver"
 
 build = "build.rs"
@@ -27,7 +27,10 @@ path = "src/bin/nightsaver-auth.rs"
 
 [dependencies]
 x11rb = { version = "0.14", features = ["allow-unsafe-code", "image", "screensaver", "xinput", "xkb", "randr", "dpms", "shm", "xfixes"] }
-xkbcommon = { version = "0.9", default-features = false, features = ["x11"] }
+xkbcommon = { version = "0.9", default-features = false, features = ["x11", "wayland"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 libpam-sys = "0.2"
 nix = { version = "0.31", features = ["user", "signal"] }
 libc = "0.2"
@@ -41,3 +44,7 @@ log = { version = "0.4", features = ["std"] }
 lto = true
 codegen-units = 1
 strip = true
+
+[dev-dependencies]
+# Test helper only (examples/wl_keys.rs): the virtual-keyboard protocol.
+wayland-protocols-misc = { version = "0.3", features = ["client"] }

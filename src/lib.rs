@@ -15,6 +15,7 @@ pub mod lock;
 pub mod logging;
 pub mod patterns;
 pub mod render;
+pub mod wayland;
 pub mod x11;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

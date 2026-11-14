@@ -1,6 +1,6 @@
 # nightsaver — agent guide
 
-OLED-friendly Xorg screensaver and PAM screen locker written in Rust. Drop-in replacement for
+OLED-friendly screensaver and PAM screen locker for Xorg and Wayland, written in Rust. Drop-in replacement for
 the `xscreensaver` daemon and the `xscreensaver-command` control protocol. License: BSD-2-Clause.
 Full design: `docs/PLAN.md`. Read it before touching code.
 
@@ -9,8 +9,11 @@ Full design: `docs/PLAN.md`. Read it before touching code.
 - MidnightBSD 4.x amd64 (FreeBSD-derived). Rust target `x86_64-unknown-freebsd`.
 - Build with the **system toolchain from mports**: `/usr/local/bin/cargo`, rustc 1.96.x.
   Do not install rustup toolchains. `edition = "2024"`, `rust-version = "1.96"`.
-- Xorg only (no Wayland). Required X extensions: MIT-SCREEN-SAVER, XInputExtension 2.x, XKEYBOARD,
+- Xorg. Required X extensions: MIT-SCREEN-SAVER, XInputExtension 2.x, XKEYBOARD,
   RANDR, DPMS. Optional: MIT-SHM, XFIXES, XINERAMA.
+- Wayland (experimental). Required: wlr-layer-shell, ext-idle-notify-v1. For locking:
+  ext-session-lock-v1 (wlroots compositors; KWin lacks it and is blank-only; GNOME is refused).
+  Optional: wlr-output-power-management. Pure-Rust `wayland-client`, no libwayland.
 - Auth is **OpenPAM** (`/usr/include/security/pam_*.h`, `-lpam`), not Linux-PAM. Default PAM service
   name is `xscreensaver` so the existing `/usr/local/etc/pam.d/xscreensaver` policy
   (`pam_exec.so expose_authtok /usr/local/libexec/unix-selfauth-helper`) works unprivileged.
@@ -25,6 +28,7 @@ src/config/                    merged Config: CLI > ~/.config/nightsaver/config.
 src/compat/protocol.rs         SCREENSAVER ClientMessage + _SCREENSAVER_* root/window properties
 src/control.rs                 control socket ($XDG_RUNTIME_DIR/nightsaver-<display>.sock): wire format, server, client helpers
 src/display/ src/input.rs      display-independent contract: trait Backend + DisplayEvent, Monitor + sanitize, KeyInput + classify
+src/wayland/                   mod.rs (impl Backend): layer-shell blanking, session lock, seat input, idle, output power; shm.rs buffers
 src/x11/                       backend.rs (impl Backend) over x11rb XCBConnection, monitors, saver windows, idle, grabs, present, keyboard
 src/render/                    Framebuffer (0x00RRGGBB), bitmap font, OLED post-pass
 src/patterns/                  trait Pattern + blank/clock/starfield/matrix/midnight/cat/juggler/puppy/penguin (+ assets/)
@@ -44,7 +48,12 @@ etc/ man/ tests/ Makefile      packaging, man pages, Xvfb smoke test
    shared contract requires updating every user in the same change and saying so in your report.
 3. **Lock-screen security invariants** (non-negotiable):
    - Never unmap, lower, or exit while `SaverState::Locked` except after a successful PAM result.
-   - Never show the unlock dialog without a successful keyboard **and** pointer grab.
+   - Never show the unlock dialog without exclusive input: a successful keyboard **and**
+     pointer grab on X, a session lock the compositor has confirmed (`locked`) on Wayland.
+     A lock that was only requested is pending, never Locked.
+   - On Wayland the session lock is ended (`unlock_and_destroy`) only in
+     `Backend::release_exclusive`, which the daemon reaches only when not locked or after a
+     successful PAM result. Dropping the daemon or the backend must never unlock.
    - Password buffers are `zeroize::Zeroizing`; never log them or any key input.
    - PAM/system errors are treated as "denied", never as "unlocked". PAM runs only in the
      `nightsaver-auth` helper process; the daemon never calls `pam_*` itself, and only the
@@ -55,7 +64,7 @@ etc/ man/ tests/ Makefile      packaging, man pages, Xvfb smoke test
      mean "denied", never "unlocked". Commands from the control socket go through
      `Daemon::command` like X ones (no second code path past the lock rules), and the socket
      only accepts peers with our uid. Synthetic (`XSendEvent`) events other than ClientMessage
-     are dropped. Config and log files are checked for ownership and mode before use.
+     are dropped (X only). Config and log files are checked for ownership and mode before use.
 4. **xscreensaver compatibility is defined by behaviour**, verified with the real
    `/usr/local/bin/xscreensaver-command` and `xprop -root`. When in doubt read the xscreensaver
    source (`driver/remote.c`, `driver/windows.c`, `driver/xscreensaver.c`, `driver/prefs.c`) rather
@@ -65,11 +74,13 @@ etc/ man/ tests/ Makefile      packaging, man pages, Xvfb smoke test
 6. **Dependencies are fixed** in `Cargo.toml`. Do not add crates without asking; prefer std.
    No bindgen/libclang at build time.
 7. **Unsafe** is allowed only in `src/lock/pam.rs`, for thin libc calls (e.g. `localtime_r`,
-   `setrlimit`) and where x11rb/xkbcommon require it; every
+   `setrlimit`, `getpeereid`, `shm_open`, `poll`) and where x11rb/xkbcommon require it
+   (including the keymap descriptor a Wayland compositor sends); every
    `unsafe` block gets a `// SAFETY:` comment.
 8. `cargo build`, `cargo test`, and `cargo clippy --all-targets -- -D warnings` must pass before
    you report done. Run the narrowest check first, then the full set.
-9. Never run the daemon on `DISPLAY=:0` without being told; use `Xvfb :99` (`tests/xvfb_smoke.sh`).
+9. Never run the daemon on `DISPLAY=:0` (or in the user's Wayland session) without being told;
+   use `Xvfb :99` (`tests/xvfb_smoke.sh`) or a headless sway (`tests/wayland_smoke.sh`).
    Never `kill -9` a running locker.
 10. Commits: only when asked. Messages are imperative, one line summary, body explains why.
 11. **Changes go through pull requests.** Never commit to or push `master` directly. For each
