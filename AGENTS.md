@@ -23,12 +23,12 @@ src/bin/nightsaver-auth.rs     PAM helper process (one per unlock attempt; see s
 src/cli.rs                     xscreensaver-compatible flag parsing
 src/config/                    merged Config: CLI > ~/.config/nightsaver/config.toml > ~/.xscreensaver > defaults
 src/compat/protocol.rs         SCREENSAVER ClientMessage + _SCREENSAVER_* root/window properties
-src/display/ src/input.rs      display-independent types: Monitor + sanitize, KeyInput + classify
-src/x11/                       x11rb XCBConnection, monitors, saver windows, idle, grabs, present, keyboard
+src/display/ src/input.rs      display-independent contract: trait Backend + DisplayEvent, Monitor + sanitize, KeyInput + classify
+src/x11/                       backend.rs (impl Backend) over x11rb XCBConnection, monitors, saver windows, idle, grabs, present, keyboard
 src/render/                    Framebuffer (0x00RRGGBB), bitmap font, OLED post-pass
 src/patterns/                  trait Pattern + blank/clock/starfield/matrix/midnight/cat/juggler/puppy/penguin (+ assets/)
 src/lock/                      Locker state machine, helper-process auth, PAM FFI, unlock dialog
-src/daemon.rs                  event loop: Idle -> Blanked -> Locked
+src/daemon.rs                  event loop: Idle -> Blanked -> Locked (policy only; display access goes through Backend)
 etc/ man/ tests/ Makefile      packaging, man pages, Xvfb smoke test
 ```
 

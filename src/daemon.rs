@@ -1,6 +1,9 @@
 //! Daemon event loop and Idle -> Blanked -> Locked state machine. Owner: Opus F.
 //!
-//! Single-threaded: `X11::wait_event_timeout` is the only blocking point. Every timer
+//! All display mechanics are behind `display::Backend` (X11: `x11::backend`); this file is
+//! policy only and never talks to the display server itself.
+//!
+//! Single-threaded: `Backend::wait_event` is the only blocking point. Every timer
 //! (idle poll, lock, cycle, frame, config reload, grab retry, locker deadline) is an explicit
 //! `Instant` and the wait is bounded by the nearest one (and by 1 s, so signal flags are seen
 //! promptly; 100 ms while the unlock dialog is up or PAM is running on its worker thread).
@@ -9,16 +12,16 @@
 //! `LockEvent::Unlocked` from the locker; EXIT/RESTART/SIGTERM/SIGINT are refused while locked;
 //! keys and pointer wake-ups reach the locker only while we hold the keyboard+pointer grab.
 //!
-//! Grabs: keyboard and pointer are grabbed on the root window (`grab.rs`), so recreating the
-//! saver windows on a RANDR change never drops them. `SaverState::Locked` (status LOCK, reply
-//! `+locking`) is entered only while both grabs are held; otherwise the lock stays pending
-//! (`lock_pending`, status BLANK) and the grab is retried every second; activity does not cancel
-//! a pending lock. A broken grab (FocusOut with mode Ungrab, our window unmapped, or a failed
-//! re-assert every 2 s while locked) hides the dialog and re-grabs at once.
+//! Grabs: "grabbed" means the backend holds exclusive input (on X11 a keyboard and pointer
+//! grab). `SaverState::Locked` (status LOCK, reply `+locking`) is entered only while it is
+//! held; otherwise the lock stays pending (`lock_pending`, status BLANK) and the grab is
+//! retried every second; activity does not cancel a pending lock. A broken grab (reported by
+//! the backend, or a failed re-assert every 2 s while locked) hides the dialog and re-grabs
+//! at once.
 //!
 //! Robustness: each loop iteration runs under `catch_unwind`; a panic switches to the blank
-//! pattern, hides the dialog and continues. Only a failing `sync()` (dead connection) ends the
-//! loop with an error.
+//! pattern, hides the dialog and continues. Only a failing `check_connection()` (dead
+//! connection) ends the loop with an error.
 
 use std::error::Error;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -26,26 +29,14 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use x11rb::connection::Connection;
-use x11rb::protocol::Event;
-use x11rb::protocol::dpms;
-use x11rb::protocol::xproto::{
-    AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, CreateWindowAux, EventMask, NotifyMode,
-    Place, PropMode, Visibility, Window, WindowClass,
-};
-use x11rb::wrapper::ConnectionExt as _;
-
 use crate::cli::Args;
-use crate::compat::protocol::{self, Command, Status};
+use crate::compat::protocol::{Command, Status};
 use crate::config::{Config, Mode, ResolvedBackend, resolve_backend, wayland_session};
 use crate::patterns::{self, Pattern, Rng};
 use crate::render::Framebuffer;
 use crate::render::oled::OledGuard;
-use crate::x11::conn::X11;
-use crate::x11::present::Presenter;
-use crate::x11::saver_window::{self, SaverWindows};
-use crate::display::Monitor;
-use crate::x11::{X11Error, grab, idle, monitors};
+use crate::display::{Backend, DisplayEvent, Monitor, SurfaceId};
+use crate::x11::backend::X11Backend;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaverState {
@@ -54,25 +45,20 @@ pub enum SaverState {
     Locked,
 }
 
-/// Program name published in WM_CLASS res_name / WM_COMMAND of the rendezvous window.
 const PROGNAME: &str = "nightsaver";
 const IDLE_POLL: Duration = Duration::from_secs(1);
 const CONFIG_CHECK: Duration = Duration::from_secs(5);
 const GRAB_RETRY: Duration = Duration::from_secs(1);
-/// Upper bound on X events handled per loop iteration before timers run.
+/// Upper bound on display events handled per loop iteration before timers run.
 const MAX_EVENTS_PER_ITERATION: usize = 256;
 /// How long activation waits for the grab (xscreensaver tries 4 x 1 s). Command replies are
 /// sent after activation, and xscreensaver-command gives up after about 10 s.
 const GRAB_TIMEOUT: Duration = Duration::from_secs(3);
 /// Re-assert the grab this often while locked (detects a grab broken behind our back).
 const GRAB_REASSERT: Duration = Duration::from_secs(2);
-/// Periodic re-raise of the saver windows while active (backstop for missed restacks).
-const RAISE_PERIOD: Duration = Duration::from_secs(5);
-/// Minimum spacing of raises, so two always-on-top clients cannot start a raise storm.
-const RAISE_MIN_GAP: Duration = Duration::from_millis(250);
 /// Retry delay after a failed relayout.
 const RELAYOUT_RETRY: Duration = Duration::from_secs(1);
-/// Back-off after an error from polling the X connection while `sync()` still works.
+/// Back-off after an error from reading display events while the connection still works.
 const POLL_ERROR_PAUSE: Duration = Duration::from_millis(10);
 /// Upper bound for one wait, so signal flags are noticed promptly.
 const MAX_WAIT: Duration = Duration::from_secs(1);
@@ -81,21 +67,15 @@ const LOCK_UI_WAIT: Duration = Duration::from_millis(100);
 const MIN_DIALOG_FPS: u32 = 10;
 
 // ---------------------------------------------------------------------------
-// Lock / keyboard adapter: the only place that touches the lock and keyboard APIs
-// (kept as one seam so API changes in lock/ or x11/keyboard.rs stay local).
+// Lock adapter: the only place that touches the lock API (kept as one seam so API
+// changes in lock/ stay local).
 // ---------------------------------------------------------------------------
 mod lockapi {
     use std::time::{Duration, Instant};
 
-    use x11rb::protocol::Event;
-    use x11rb::protocol::xproto::KeyPressEvent;
-
+    use crate::input::KeyInput;
     use crate::lock::{LockEvent, Locker};
     use crate::render::Framebuffer;
-    use crate::x11::X11Error;
-    use crate::x11::conn::X11;
-    use crate::input::KeyInput;
-    use crate::x11::keyboard::Keyboard;
 
     pub fn new_locker(user: String, service: String, passwd_timeout: Duration) -> Locker {
         Locker::new(user, service, passwd_timeout)
@@ -132,25 +112,10 @@ mod lockapi {
     pub fn current_username() -> Option<String> {
         crate::lock::pam::current_username()
     }
-    pub fn keyboard_new(x: &X11) -> Result<Keyboard, X11Error> {
-        Keyboard::new(x)
-    }
-    pub fn keyboard_event(kb: &mut Keyboard, ev: &Event) -> bool {
-        kb.handle_event(ev)
-    }
-    pub fn keyboard_refresh(kb: &mut Keyboard, x: &X11) {
-        if let Err(e) = kb.reload_if_stale(x) {
-            log::warn!("keymap reload failed: {e}");
-        }
-    }
-    pub fn translate(kb: &Keyboard, ev: &KeyPressEvent) -> KeyInput {
-        kb.translate(ev)
-    }
 }
 
-use crate::lock::{LockEvent, Locker};
 use crate::input::KeyInput;
-use crate::x11::keyboard::Keyboard;
+use crate::lock::{LockEvent, Locker};
 
 // ---------------------------------------------------------------------------
 // Signals
@@ -186,19 +151,6 @@ fn install_signal_handlers() {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-fn hostname() -> String {
-    let mut buf = [0u8; 256];
-    // SAFETY: `buf` is a valid writable buffer of the length we pass; gethostname writes at
-    // most that many bytes and we only read up to the first NUL (or the whole buffer).
-    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
-    if rc != 0 {
-        return "localhost".into();
-    }
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    let s = String::from_utf8_lossy(&buf[..end]).into_owned();
-    if s.is_empty() { "localhost".into() } else { s }
-}
-
 fn mtimes(paths: &[PathBuf]) -> Vec<Option<SystemTime>> {
     paths
         .iter()
@@ -229,28 +181,14 @@ fn later(t: Instant, d: Duration) -> Instant {
         .unwrap_or(t)
 }
 
-fn secs_u16(d: Duration) -> u16 {
-    d.as_secs().min(u64::from(u16::MAX)) as u16
-}
-
 /// Everything drawn on one monitor.
 struct Screen {
-    win: Window,
+    surface: SurfaceId,
     mon: Monitor,
     fb: Framebuffer,
-    presenter: Presenter,
     pattern: Box<dyn Pattern>,
     oled: OledGuard,
     rng: Rng,
-}
-
-/// Server DPMS settings saved at activation, restored at deactivation.
-#[derive(Debug, Clone, Copy)]
-struct SavedDpms {
-    standby: u16,
-    suspend: u16,
-    off: u16,
-    enabled: bool,
 }
 
 /// Why `deactivate` is called; `Unlocked` is the only reason accepted while locked.
@@ -271,14 +209,10 @@ enum Exit {
 struct Daemon {
     args: Args,
     cfg: Config,
-    x: X11,
-    /// Screen 0 root: `_SCREENSAVER_STATUS` lives here.
-    status_root: Window,
-    /// Hidden rendezvous window carrying `_SCREENSAVER_VERSION`.
-    ident: Window,
+    backend: Box<dyn Backend>,
     state: SaverState,
-    windows: SaverWindows,
     screens: Vec<Screen>,
+    /// The backend holds exclusive input (keyboard and pointer), as far as we know.
     grabbed: bool,
     /// A lock was requested (LOCK command or lock timeout) but the grab is not held yet.
     lock_pending: bool,
@@ -286,17 +220,13 @@ struct Daemon {
     current: Option<usize>,
     rng: Rng,
     user: Option<String>,
-    keyboard: Option<Keyboard>,
     locker: Option<Locker>,
     status: Status,
     /// Time published with the status; kept across LOCK <-> AUTH like xscreensaver's locked_at.
     status_since: SystemTime,
-    /// Low 16 bits of a request sequence number sent right after our last successful grab.
-    /// Focus events older than it were caused by an earlier grab break we already handled.
-    grab_seq: u16,
     /// Force the next `update_status` to write even if the status is unchanged.
     status_dirty: bool,
-    /// Baseline for idle detection: idle = min(server idle, now - activity_reset).
+    /// Baseline for idle detection: idle = min(display idle, now - activity_reset).
     activity_reset: Instant,
     next_idle_poll: Instant,
     lock_deadline: Option<Instant>,
@@ -307,25 +237,20 @@ struct Daemon {
     next_grab_retry: Option<Instant>,
     next_grab_reassert: Option<Instant>,
     next_relayout: Option<Instant>,
-    next_periodic_raise: Option<Instant>,
-    /// A raise requested while rate-limited.
-    pending_raise: Option<Instant>,
-    last_raise: Option<Instant>,
-    /// Exact items last written to `_SCREENSAVER_STATUS` (to undo foreign writes).
-    status_items: Vec<u32>,
     watch: Vec<PathBuf>,
     watch_mtimes: Vec<Option<SystemTime>>,
     /// Pointer position (root coords) and accumulated motion since activation.
     motion_last: Option<(i32, i32)>,
     motion_accum: f64,
-    dpms_saved: Option<SavedDpms>,
-    /// Software stand-in for DPMS "off" on servers without the extension: frames are pure
+    /// The backend can power the monitor down itself (`Capabilities::power_control`).
+    has_power: bool,
+    /// Software stand-in for DPMS "off" on displays without power control: frames are pure
     /// black instead of the pattern (see `soft_off_delay`). Cleared by waking and unblanking.
     soft_off: bool,
-    /// When the stand-in engages; only armed while blanked on a server without DPMS.
+    /// When the stand-in engages; only armed while blanked without power control.
     soft_off_deadline: Option<Instant>,
-    /// False when this X server is XWayland (a Wayland session is running): grabs there
-    /// do not cover native Wayland clients, so nothing may ever be reported as locked.
+    /// False when the display cannot be locked (`Capabilities::can_lock`; XWayland): grabs
+    /// there do not cover native Wayland clients, so nothing may ever be reported as locked.
     lockable: bool,
 }
 
@@ -347,80 +272,28 @@ pub fn run(args: Args, cfg: Config) -> Result<(), Box<dyn Error>> {
              Wayland clients; locking is disabled and the screen will only be blanked"
         );
     }
-    let x = X11::open(cfg.display.as_deref())?;
     let display_name = cfg
         .display
         .clone()
         .or_else(|| std::env::var("DISPLAY").ok())
         .unwrap_or_default();
 
-    // Refuse to start when another saver (xscreensaver or us) owns a rendezvous window.
-    if let Some(w) = protocol::find_saver_window_any_screen(&x.conn, &x.atoms)? {
-        let id = protocol::read_id(&x.conn, w, &x.atoms)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "???".into());
-        let id: String = id.chars().map(|c| if c.is_control() { '?' } else { c }).collect();
-        eprintln!(
-            "{PROGNAME}: already running on display {display_name} (window 0x{w:x})\n from process {id}"
-        );
-        std::process::exit(1);
-    }
-
     install_signal_handlers();
     install_panic_hook();
-    idle::disable_server_blanker(&x);
-    idle::select_activity_events(&x)?;
-    monitors::select_hotplug(&x)?;
-    saver_window::select_root_events(&x)?;
-
-    let status_root = x.conn.setup().roots[0].root;
-    if status_root != x.root {
-        let a = x.conn.get_window_attributes(status_root)?.reply()?;
-        x.conn
-            .change_window_attributes(
-                status_root,
-                &ChangeWindowAttributesAux::new()
-                    .event_mask(a.your_event_mask | EventMask::PROPERTY_CHANGE),
-            )?
-            .check()?;
-    }
-    let ident = create_ident_window(&x, status_root)?;
     let user = lockapi::current_username().or_else(|| {
         nix::unistd::User::from_uid(nix::unistd::getuid())
             .ok()
             .flatten()
             .map(|u| u.name)
     });
-    let id = protocol::format_id(
-        std::process::id(),
-        user.as_deref().unwrap_or("???"),
-        &hostname(),
-    );
-    protocol::publish_identity(
-        &x.conn,
-        ident,
-        &x.atoms,
-        PROGNAME,
-        crate::COMPAT_XSCREENSAVER_VERSION,
-        &id,
-    )?;
-    let status_items = write_status(&x, status_root, Status::Off, SystemTime::now(), &[])?;
-
-    let keyboard = match lockapi::keyboard_new(&x) {
-        Ok(k) => Some(k),
-        Err(e) => {
-            if cfg.lock {
-                log::error!(
-                    "keyboard setup failed ({e}); it is retried at lock time, and if it still \
-                     fails the screen locks WITHOUT any way to type a password"
-                );
-            } else {
-                log::error!("keyboard setup failed ({e}); it is retried at lock time");
-            }
-            None
-        }
-    };
+    let backend: Box<dyn Backend> = Box::new(X11Backend::open(
+        cfg.display.as_deref(),
+        &display_name,
+        user.as_deref(),
+        cfg.lock,
+        lockable,
+    )?);
+    let caps = backend.capabilities();
 
     log::info!(
         "{PROGNAME} {} (xscreensaver {} compatible) on display {display_name}: timeout {}s, \
@@ -437,7 +310,7 @@ pub fn run(args: Args, cfg: Config) -> Result<(), Box<dyn Error>> {
     if cfg.splash {
         log::info!("splash disabled in nightsaver");
     }
-    if !x.has_dpms && cfg.dpms.enabled {
+    if !caps.power_control && cfg.dpms.enabled {
         log::info!("no DPMS extension: the screen goes black instead of powering off");
     }
 
@@ -447,22 +320,17 @@ pub fn run(args: Args, cfg: Config) -> Result<(), Box<dyn Error>> {
     let mut d = Daemon {
         args,
         cfg,
-        x,
-        status_root,
-        ident,
+        backend,
         state: SaverState::Idle,
-        windows: SaverWindows::default(),
         screens: Vec::new(),
         grabbed: false,
         lock_pending: false,
         current: None,
         rng: Rng::new(time_seed()),
         user,
-        keyboard,
         locker: None,
         status: Status::Off,
         status_since: SystemTime::now(),
-        grab_seq: 0,
         status_dirty: false,
         activity_reset: now,
         next_idle_poll: later(now, IDLE_POLL),
@@ -474,18 +342,14 @@ pub fn run(args: Args, cfg: Config) -> Result<(), Box<dyn Error>> {
         next_grab_retry: None,
         next_grab_reassert: None,
         next_relayout: None,
-        next_periodic_raise: None,
-        pending_raise: None,
-        last_raise: None,
-        status_items,
         watch,
         watch_mtimes,
         motion_last: None,
         motion_accum: 0.0,
-        dpms_saved: None,
+        has_power: caps.power_control,
         soft_off: false,
         soft_off_deadline: None,
-        lockable,
+        lockable: caps.can_lock,
     };
 
     match d.event_loop()? {
@@ -511,42 +375,6 @@ fn install_panic_hook() {
     }));
 }
 
-/// Write `_SCREENSAVER_STATUS` and return the exact items written.
-fn write_status(
-    x: &X11,
-    root: Window,
-    status: Status,
-    since: SystemTime,
-    hacks: &[u32],
-) -> Result<Vec<u32>, Box<dyn Error>> {
-    let items = protocol::encode_status(&x.atoms, status, since, hacks)?;
-    protocol::set_status(&x.conn, root, &x.atoms, status, since, hacks)?;
-    Ok(items)
-}
-
-fn create_ident_window(x: &X11, root: Window) -> Result<Window, X11Error> {
-    let w = x.conn.generate_id()?;
-    let screen = &x.conn.setup().roots[0];
-    x.conn
-        .create_window(
-            screen.root_depth,
-            w,
-            root,
-            0,
-            0,
-            1,
-            1,
-            0,
-            WindowClass::INPUT_OUTPUT,
-            screen.root_visual,
-            &CreateWindowAux::new()
-                .override_redirect(1)
-                .event_mask(EventMask::PROPERTY_CHANGE),
-        )?
-        .check()?;
-    Ok(w)
-}
-
 /// Replace this process with a fresh copy of itself (same argv).
 fn restart() -> Result<(), Box<dyn Error>> {
     use std::os::unix::process::CommandExt;
@@ -560,13 +388,10 @@ fn restart() -> Result<(), Box<dyn Error>> {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        // Best-effort teardown; `X11` closes the connection afterwards, which destroys the
-        // rendezvous window anyway.
+        // Best-effort teardown; the backend withdraws our identity and status and closes
+        // the connection when it is dropped right after this.
         self.teardown_windows();
         self.restore_dpms();
-        let _ = self.x.conn.destroy_window(self.ident);
-        let _ = protocol::clear_status(&self.x.conn, self.status_root, &self.x.atoms);
-        let _ = self.x.sync();
     }
 }
 
@@ -607,9 +432,7 @@ impl Daemon {
             }
             ev = self.next_event(None)?;
         }
-        if let Some(kb) = self.keyboard.as_mut() {
-            lockapi::keyboard_refresh(kb, &self.x);
-        }
+        self.backend.end_of_batch();
         match self.handle_signals() {
             Ok(Some(exit)) => return Ok(Some(exit)),
             Ok(None) => {}
@@ -621,18 +444,14 @@ impl Daemon {
         Ok(None)
     }
 
-    /// Wait for (`Some(timeout)`) or poll (`None`) the next event. A ConnectionError (for
-    /// example a ParseError) is fatal only when the connection is really gone (`sync` fails);
+    /// Wait for (`Some(timeout)`) or poll (`None`) the next event. A read error (for
+    /// example an unparsable event) is fatal only when the connection is really gone;
     /// otherwise the bad event is dropped and the loop continues.
-    fn next_event(&self, timeout: Option<Duration>) -> Result<Option<Event>, Box<dyn Error>> {
-        let r = match timeout {
-            Some(t) => self.x.wait_event_timeout(t),
-            None => self.x.poll_event(),
-        };
-        match r {
+    fn next_event(&mut self, timeout: Option<Duration>) -> Result<Option<DisplayEvent>, Box<dyn Error>> {
+        match self.backend.wait_event(timeout) {
             Ok(ev) => Ok(ev),
             Err(e) => {
-                self.recoverable(format!("reading X events: {e}").into())?;
+                self.recoverable(e)?;
                 std::thread::sleep(POLL_ERROR_PAUSE);
                 Ok(None)
             }
@@ -659,11 +478,11 @@ impl Daemon {
         }
     }
 
-    /// An error from event handling or a timer. Errors must not end the daemon while the X
-    /// connection works (exiting would drop a lock): log and continue. Only a dead
+    /// An error from event handling or a timer. Errors must not end the daemon while the
+    /// display connection works (exiting would drop a lock): log and continue. Only a dead
     /// connection (where the server has already removed our windows) is fatal.
     fn recoverable(&self, e: Box<dyn Error>) -> Result<(), Box<dyn Error>> {
-        if let Err(conn) = self.x.sync() {
+        if let Err(conn) = self.backend.check_connection() {
             log::error!("X connection lost ({e}; {conn})");
             return Err(e);
         }
@@ -683,8 +502,7 @@ impl Daemon {
         t = min_opt(t, self.next_grab_retry);
         t = min_opt(t, self.next_grab_reassert);
         t = min_opt(t, self.next_relayout);
-        t = min_opt(t, self.next_periodic_raise);
-        t = min_opt(t, self.pending_raise);
+        t = min_opt(t, self.backend.next_deadline());
         let mut cap = MAX_WAIT;
         if self.state == SaverState::Locked
             && let Some(l) = &self.locker
@@ -730,8 +548,11 @@ impl Daemon {
             SaverState::Idle => {
                 if now >= self.next_idle_poll {
                     self.next_idle_poll = later(now, IDLE_POLL);
-                    let server = Duration::from_millis(u64::from(idle::idle_ms(&self.x)?));
-                    let idle = server.min(now.saturating_duration_since(self.activity_reset));
+                    let since_reset = now.saturating_duration_since(self.activity_reset);
+                    let idle = match self.backend.idle_time()? {
+                        Some(display) => display.min(since_reset),
+                        None => since_reset,
+                    };
                     log::trace!("idle {} ms", idle.as_millis());
                     if self.cfg.mode != Mode::Off
                         && !self.cfg.timeout.is_zero()
@@ -746,11 +567,7 @@ impl Daemon {
                 if self.next_relayout.is_some_and(|t| now >= t) {
                     self.relayout()?;
                 }
-                if self.next_periodic_raise.is_some_and(|t| now >= t)
-                    || self.pending_raise.is_some_and(|t| now >= t)
-                {
-                    self.raise_now(now);
-                }
+                self.backend.tick(now);
                 if self.next_grab_retry.is_some_and(|t| now >= t) {
                     self.retry_grab();
                 }
@@ -788,174 +605,63 @@ impl Daemon {
     // -----------------------------------------------------------------------
     // Events
     // -----------------------------------------------------------------------
-    fn handle_event(&mut self, ev: Event) -> Result<Option<Exit>, Box<dyn Error>> {
-        // Any client can SendEvent arbitrary events to our windows. Only ClientMessage (the
-        // control protocol) is legitimately synthetic; forged Unmap/Focus/XKB/Configure events
-        // would otherwise hide the dialog, alter modifier state or force relayouts.
-        if ev.sent_event() && !matches!(ev, Event::ClientMessage(_)) {
-            log::trace!("synthetic event ignored: {}", event_name(&ev));
-            return Ok(None);
-        }
-        if let Some(kb) = self.keyboard.as_mut()
-            && lockapi::keyboard_event(kb, &ev)
-        {
-            return Ok(None);
-        }
+    fn handle_event(&mut self, ev: DisplayEvent) -> Result<Option<Exit>, Box<dyn Error>> {
         let active = self.state != SaverState::Idle;
-        match &ev {
-            Event::ClientMessage(cm) => {
-                if cm.window != self.ident {
-                    log::debug!("ClientMessage for foreign window 0x{:x} ignored", cm.window);
-                    return Ok(None);
-                }
-                match protocol::parse_client_message(cm, &self.x.atoms) {
-                    Some(cmd) => {
-                        if cmd == Command::Deactivate
-                            && let Some(pid) = protocol::deactivate_caller_pid(cm)
-                        {
-                            log::debug!("DEACTIVATE sent by pid {pid}");
-                        }
-                        return self.command(cmd);
-                    }
-                    None => log::debug!("unrecognised ClientMessage ignored"),
-                }
-            }
-            Event::Error(e) => log::debug!("X error: {e:?}"),
-            Event::Expose(e) => {
-                if e.count == 0 {
-                    self.present_window(e.window)?;
-                }
-            }
-            Event::PropertyNotify(p) => {
-                if p.window == self.status_root
-                    && Some(p.atom) == self.x.atoms.by_name(protocol::ATOM_STATUS)
-                {
-                    self.verify_status();
-                }
-            }
-            // ---- covering: keep the saver windows on top and mapped ----
-            Event::MapNotify(_) if self.windows.is_foreign_map(&ev) => {
+        match ev {
+            DisplayEvent::Internal => {}
+            DisplayEvent::Command(cmd) => return self.command(cmd),
+            DisplayEvent::Redraw(surface) => self.present_surface(surface)?,
+            DisplayEvent::SurfacesDisturbed => {
                 if active {
-                    log::debug!("foreign window mapped: raising saver windows");
-                    self.request_raise();
-                }
-            }
-            Event::ConfigureNotify(c) if active && c.window != self.x.root => {
-                if let Some(&(_, mon)) =
-                    self.windows.windows().iter().find(|(w, _)| *w == c.window)
-                {
-                    let moved = (c.x, c.y, c.width, c.height)
-                        != (mon.x, mon.y, mon.width.max(1), mon.height.max(1));
-                    if moved && c.event == c.window {
-                        log::warn!("saver window 0x{:x} moved/resized by another client", c.window);
-                        self.next_relayout = Some(Instant::now());
-                    }
-                } else {
-                    log::trace!("foreign window restacked/configured: raising");
-                    self.request_raise();
-                }
-            }
-            Event::CirculateNotify(c) => {
-                if active && !self.windows.contains(c.window) && c.place == Place::ON_TOP {
-                    log::debug!("foreign window circulated to the top: raising");
-                    self.request_raise();
-                }
-            }
-            Event::VisibilityNotify(v) => {
-                if active
-                    && self.windows.contains(v.window)
-                    && v.state != Visibility::UNOBSCURED
-                    && !self.windows.overlapping()
-                {
-                    log::debug!("saver window obscured ({:?}): raising", v.state);
-                    self.request_raise();
-                }
-            }
-            Event::UnmapNotify(u) => {
-                // Our windows report this twice (own STRUCTURE_NOTIFY and root
-                // SUBSTRUCTURE_NOTIFY); act once. Old windows of a relayout are no longer ours.
-                if active && u.event == u.window && self.windows.contains(u.window) {
-                    self.grab_lost("saver window unmapped by another client");
-                }
-            }
-            Event::DestroyNotify(d) => {
-                if active && d.event == d.window && self.windows.contains(d.window) {
-                    log::warn!("saver window 0x{:x} destroyed by another client", d.window);
                     self.next_relayout = Some(Instant::now());
                 }
             }
-            Event::FocusIn(f) | Event::FocusOut(f) => {
-                if active
-                    && self.grabbed
-                    && f.mode == NotifyMode::UNGRAB
-                    && (f.sequence.wrapping_sub(self.grab_seq) as i16) >= 0
-                    && (f.event == self.x.root || self.windows.contains(f.event))
-                {
-                    self.grab_lost("focus change with mode Ungrab");
+            DisplayEvent::ExclusiveLost(why) => {
+                if active {
+                    self.grab_lost(why);
                 }
             }
-            e if monitors::is_hotplug_event(e) => {
-                log::debug!("monitor layout change");
+            DisplayEvent::OutputsChanged => {
                 if active {
                     self.relayout()?;
                 }
             }
-            Event::ScreensaverNotify(_) => {}
-            // ---- input: never Debug-format these (AGENTS.md rule 3) ----
-            Event::KeyRelease(_) => log::trace!("KeyRelease ignored"),
-            Event::ButtonRelease(_) => log::trace!("ButtonRelease ignored"),
-            Event::KeyPress(k) => {
-                if !self.is_input_window(k.event) || k.response_type & 0x80 != 0 {
-                    log::debug!("KeyPress not from our grab (foreign or synthetic): ignored");
-                    return Ok(None);
-                }
-                match self.state {
-                    SaverState::Idle => {}
-                    SaverState::Blanked => self.blanked_activity("key press"),
-                    SaverState::Locked => {
-                        if !self.grabbed {
-                            log::trace!("KeyPress without grab ignored");
-                        } else if self.keyboard.is_some() && self.locker.is_some() {
-                            // A real DPMS monitor wakes on the key by itself; the software
-                            // power-off has to be ended here.
-                            self.wake_display();
-                            let (Some(kb), Some(l)) = (self.keyboard.as_mut(), self.locker.as_mut())
-                            else {
-                                return Ok(None);
-                            };
-                            let input = lockapi::translate(kb, k);
-                            let le = lockapi::key(l, input, Instant::now());
-                            self.handle_lock_event(le)?;
-                        } else {
-                            // No keyboard (L6): keys can only reveal the dialog.
-                            self.wake_locked()?;
-                        }
+            // ---- input: never log these (AGENTS.md rule 3) ----
+            DisplayEvent::Key(input) => match self.state {
+                SaverState::Idle => {}
+                SaverState::Blanked => self.blanked_activity("key press"),
+                SaverState::Locked => {
+                    if !self.grabbed {
+                        log::trace!("KeyPress without grab ignored");
+                    } else if let (Some(input), true) = (input, self.locker.is_some()) {
+                        // A real DPMS monitor wakes on the key by itself; the software
+                        // power-off has to be ended here.
+                        self.wake_display();
+                        let Some(l) = self.locker.as_mut() else {
+                            return Ok(None);
+                        };
+                        let le = lockapi::key(l, input, Instant::now());
+                        self.handle_lock_event(le)?;
+                    } else {
+                        // No keyboard (L6): keys can only reveal the dialog.
+                        self.wake_locked()?;
                     }
                 }
-            }
-            Event::ButtonPress(b) => {
-                if !self.is_input_window(b.event) || b.response_type & 0x80 != 0 {
-                    log::debug!("ButtonPress not from our grab (foreign or synthetic): ignored");
-                    return Ok(None);
-                }
-                match self.state {
-                    SaverState::Idle => {}
-                    SaverState::Blanked => self.blanked_activity("button press"),
-                    SaverState::Locked => self.wake_locked()?,
-                }
-            }
-            Event::XinputRawKeyPress(_) | Event::XinputRawButtonPress(_) => {
-                // Raw presses also arrive for the core events handled above; while locked
-                // only the core (grabbed) events count.
+            },
+            DisplayEvent::Button => match self.state {
+                SaverState::Idle => {}
+                SaverState::Blanked => self.blanked_activity("button press"),
+                SaverState::Locked => self.wake_locked()?,
+            },
+            DisplayEvent::RawActivity => {
+                // Raw presses also arrive for the grabbed events handled above; while locked
+                // only the grabbed events count.
                 if self.state == SaverState::Blanked {
                     self.blanked_activity("raw key/button");
                 }
             }
-            Event::MotionNotify(m) => {
-                if self.state != SaverState::Idle
-                    && self.is_input_window(m.event)
-                    && self.motion(i32::from(m.root_x), i32::from(m.root_y))
-                {
+            DisplayEvent::Motion { x, y } => {
+                if self.state != SaverState::Idle && self.motion(x, y) {
                     if self.state == SaverState::Blanked {
                         self.blanked_activity("pointer moved past threshold");
                     } else {
@@ -963,21 +669,8 @@ impl Daemon {
                     }
                 }
             }
-            Event::XinputRawMotion(_) => {}
-            other => {
-                if idle::is_activity_event(other) {
-                    log::trace!("activity event");
-                } else {
-                    log::trace!("event ignored: {other:?}");
-                }
-            }
         }
         Ok(None)
-    }
-
-    /// Key/pointer events are ours when reported to the grab window (root) or a saver window.
-    fn is_input_window(&self, w: Window) -> bool {
-        w == self.x.root || self.windows.contains(w)
     }
 
     /// User activity while blanked: unblank, unless a lock is pending (a pending lock is never
@@ -1008,13 +701,7 @@ impl Daemon {
 
     fn reset_motion(&mut self) {
         self.motion_accum = 0.0;
-        self.motion_last = self
-            .x
-            .conn
-            .query_pointer(self.x.root)
-            .ok()
-            .and_then(|c| c.reply().ok())
-            .map(|r| (i32::from(r.root_x), i32::from(r.root_y)));
+        self.motion_last = self.backend.pointer_position();
     }
 
     /// Pointer activity or DEACTIVATE while locked: wake the display and show the prompt.
@@ -1048,39 +735,8 @@ impl Daemon {
     // -----------------------------------------------------------------------
     // Commands
     // -----------------------------------------------------------------------
-    fn respond(&self, ok: bool, msg: &str) {
-        if let Err(e) = protocol::send_response(&self.x.conn, &self.x.atoms, self.ident, ok, msg) {
-            log::warn!("cannot send response {msg:?}: {e}");
-        }
-    }
-
-    /// Before EXIT/RESTART destroys the rendezvous window: give the client up to `limit` to read
-    /// (and delete) `_SCREENSAVER_RESPONSE`. Otherwise the real xscreensaver-command can hit
-    /// BadWindow while reading and report "xscreensaver window unexpectedly deleted" (fatal
-    /// for RESTART). Other events arriving meanwhile are dropped: we are shutting down.
-    fn await_response_read(&self, limit: Duration) {
-        let Some(resp) = self.x.atoms.by_name(protocol::ATOM_RESPONSE) else {
-            return;
-        };
-        let deadline = later(Instant::now(), limit);
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                log::debug!("client did not read the response in time");
-                return;
-            }
-            match self.x.wait_event_timeout(left) {
-                Ok(Some(Event::PropertyNotify(p)))
-                    if p.window == self.ident
-                        && p.atom == resp
-                        && p.state == x11rb::protocol::xproto::Property::DELETE =>
-                {
-                    return;
-                }
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => return,
-            }
-        }
+    fn respond(&mut self, ok: bool, msg: &str) {
+        self.backend.respond(ok, msg);
     }
 
     /// Locking needs a user name for PAM. A missing keyboard does not disable locking (L6):
@@ -1093,7 +749,7 @@ impl Daemon {
 
     /// Reply to a command once its action has finished: `+ok_msg`, or `-reason` on error (the
     /// error is passed on to be logged).
-    fn reply_after(&self, ok_msg: &str, r: Result<(), Box<dyn Error>>) -> Result<(), Box<dyn Error>> {
+    fn reply_after(&mut self, ok_msg: &str, r: Result<(), Box<dyn Error>>) -> Result<(), Box<dyn Error>> {
         match r {
             Ok(()) => {
                 self.respond(true, ok_msg);
@@ -1229,7 +885,7 @@ impl Daemon {
                 } else {
                     let restart = cmd == Command::Restart;
                     self.respond(true, if restart { "restarting" } else { "exiting" });
-                    self.await_response_read(Duration::from_secs(1));
+                    self.backend.flush_response(Duration::from_secs(1));
                     self.deactivate(Why::Exit);
                     return Ok(Some(if restart { Exit::Restart } else { Exit::Quit }));
                 }
@@ -1269,13 +925,7 @@ impl Daemon {
             }
             return Ok(());
         }
-        let mons = self.current_monitors()?;
-        let mut wins = SaverWindows::create(&self.x, &mons)?;
-        if let Err(e) = wins.map_and_raise(&self.x) {
-            wins.destroy(&self.x);
-            return Err(e.into());
-        }
-        self.windows = wins;
+        let monitors = self.backend.blank()?;
         self.state = SaverState::Blanked;
         self.current = pattern;
         self.grabbed = false;
@@ -1296,15 +946,13 @@ impl Daemon {
             && !self.cfg.cycle.is_zero())
         .then(|| now.checked_add(self.cfg.cycle))
         .flatten();
-        self.last_raise = Some(now);
-        self.next_periodic_raise = Some(later(now, RAISE_PERIOD));
 
         self.build_screens();
         self.reset_motion();
         log::info!(
             "blanked: pattern {} on {} monitor(s){}",
             self.pattern_name(self.current),
-            mons.len(),
+            monitors,
             if self.grabbed { "" } else { " (no grab)" }
         );
 
@@ -1318,42 +966,18 @@ impl Daemon {
         Ok(())
     }
 
-    /// RANDR monitors; if that fails, one monitor covering the current root geometry.
-    fn current_monitors(&self) -> Result<Vec<Monitor>, Box<dyn Error>> {
-        match monitors::monitors(&self.x) {
-            Ok(m) => Ok(m),
-            Err(e) => {
-                log::error!("cannot enumerate monitors ({e}); covering the whole root window");
-                Ok(vec![self.root_monitor()?])
-            }
-        }
-    }
-
-    /// The current root geometry (from the server, not the stale connection setup).
-    fn root_monitor(&self) -> Result<Monitor, Box<dyn Error>> {
-        let g = self.x.conn.get_geometry(self.x.root)?.reply()?;
-        Ok(Monitor {
-            x: 0,
-            y: 0,
-            width: g.width,
-            height: g.height,
-            primary: true,
-        })
-    }
-
-    /// Try to grab keyboard+pointer on the root window. On failure schedule a retry.
+    /// Try to take exclusive keyboard+pointer input. On failure schedule a retry.
     fn try_grab(&mut self, timeout: Duration) {
         if self.state == SaverState::Idle {
             return;
         }
         let now = Instant::now();
-        match grab::grab_all(&self.x, self.x.root, timeout) {
+        match self.backend.acquire_exclusive(timeout) {
             Ok(()) => {
                 if !self.grabbed {
                     log::debug!("keyboard and pointer grabbed");
                 }
                 self.grabbed = true;
-                self.mark_grab_seq();
                 self.next_grab_retry = None;
                 self.next_grab_reassert = Some(later(now, GRAB_REASSERT));
             }
@@ -1369,16 +993,6 @@ impl Daemon {
                 }
                 self.next_grab_retry = Some(later(now, GRAB_RETRY));
             }
-        }
-    }
-
-    /// Record the sequence boundary for stale FocusIn/Out(Ungrab) events (see `grab_seq`).
-    /// Called after every successful grab or re-grab, since the 16-bit window wraps after
-    /// 32768 requests (a few minutes of rendering).
-    fn mark_grab_seq(&mut self) {
-        if let Ok(c) = self.x.conn.get_input_focus() {
-            self.grab_seq = c.sequence_number() as u16;
-            let _ = c.reply();
         }
     }
 
@@ -1406,9 +1020,8 @@ impl Daemon {
         if self.state != SaverState::Locked {
             return;
         }
-        match grab::reassert(&self.x, self.x.root) {
+        match self.backend.check_exclusive() {
             Ok(true) => {
-                self.mark_grab_seq();
                 self.next_grab_reassert = Some(later(Instant::now(), GRAB_REASSERT));
             }
             Ok(false) => self.grab_lost("periodic re-grab failed"),
@@ -1423,10 +1036,7 @@ impl Daemon {
         self.grabbed = false;
         self.next_grab_reassert = None;
         self.hide_prompt();
-        if let Err(e) = self.windows.map_and_raise(&self.x) {
-            log::warn!("re-map of saver windows failed: {e}");
-        }
-        self.last_raise = Some(Instant::now());
+        self.backend.restore_cover();
         self.try_grab(Duration::from_millis(200));
         if self.grabbed {
             log::info!("grab re-acquired");
@@ -1450,47 +1060,23 @@ impl Daemon {
         }
     }
 
-    /// Raise now, or once the rate limit allows.
-    fn request_raise(&mut self) {
-        let now = Instant::now();
-        match self.last_raise {
-            Some(t) if now < later(t, RAISE_MIN_GAP) => {
-                self.pending_raise.get_or_insert(later(t, RAISE_MIN_GAP));
-            }
-            _ => self.raise_now(now),
-        }
-    }
-
-    fn raise_now(&mut self, now: Instant) {
-        self.pending_raise = None;
-        self.last_raise = Some(now);
-        self.next_periodic_raise = Some(later(now, RAISE_PERIOD));
-        if let Err(e) = self.windows.raise(&self.x) {
-            log::warn!("raise failed: {e}");
-        }
-    }
-
-    /// (Re)create the drawing state for every saver window. Failures are not fatal: a monitor
-    /// whose presenter cannot be set up gets no `Screen` and stays black (window background).
+    /// (Re)create the drawing state for every surface. Failures are not fatal: a monitor
+    /// whose surface cannot be set up for drawing gets no `Screen` and stays black.
     fn build_screens(&mut self) {
-        for s in self.screens.drain(..) {
-            s.presenter.destroy(&self.x);
-        }
+        self.screens.clear();
+        self.backend.detach_all();
         let name = self.pattern_name(self.current).to_owned();
-        for &(win, mon) in self.windows.windows() {
+        for (surface, mon) in self.backend.surfaces() {
             let (w, h) = (u32::from(mon.width), u32::from(mon.height));
-            let presenter = match Presenter::new(&self.x, w, h) {
-                Ok(p) => p,
-                Err(e) => {
-                    log::error!("cannot set up drawing for monitor {mon:?} ({e}); it stays black");
-                    continue;
-                }
-            };
+            if let Err(e) = self.backend.attach(surface, w, h) {
+                log::error!("cannot set up drawing for monitor {mon:?} ({e}); it stays black");
+                continue;
+            }
             let fb = match Framebuffer::try_new(w, h) {
                 Ok(fb) => fb,
                 Err(e) => {
                     log::error!("cannot allocate a {w}x{h} framebuffer for monitor {mon:?} ({e}); it stays black");
-                    presenter.destroy(&self.x);
+                    self.backend.detach(surface);
                     continue;
                 }
             };
@@ -1501,10 +1087,9 @@ impl Daemon {
             });
             pattern.init(w, h, self.cfg.oled.lit_budget, &mut rng);
             self.screens.push(Screen {
-                win,
+                surface,
                 mon,
                 fb,
-                presenter,
                 pattern,
                 oled: OledGuard::new(self.cfg.oled.clone()),
                 rng,
@@ -1590,19 +1175,7 @@ impl Daemon {
             }
             return false;
         }
-        if self.keyboard.is_none() {
-            match lockapi::keyboard_new(&self.x) {
-                Ok(k) => {
-                    log::info!("keyboard set up at lock time");
-                    self.keyboard = Some(k);
-                }
-                Err(e) => log::error!(
-                    "keyboard unavailable ({e}): locking anyway; no password can be typed, so \
-                     this lock cannot be undone from this display (kill the daemon from another \
-                     session)"
-                ),
-            }
-        }
+        self.backend.prepare_keyboard();
         self.locker = Some(match self.user.clone() {
             Some(user) => lockapi::new_locker(user, self.cfg.pam_service.clone(), self.cfg.passwd_timeout),
             None => {
@@ -1645,8 +1218,6 @@ impl Daemon {
         self.next_grab_retry = None;
         self.next_grab_reassert = None;
         self.next_relayout = None;
-        self.next_periodic_raise = None;
-        self.pending_raise = None;
         self.lock_pending = false;
         let now = Instant::now();
         self.activity_reset = now;
@@ -1656,49 +1227,29 @@ impl Daemon {
     }
 
     fn teardown_windows(&mut self) {
-        if self.grabbed || !self.windows.windows().is_empty() {
-            grab::ungrab_all(&self.x);
-        }
+        self.backend.release_exclusive();
         self.grabbed = false;
-        for s in self.screens.drain(..) {
-            s.presenter.destroy(&self.x);
-        }
-        self.windows.unmap(&self.x);
-        self.windows.destroy(&self.x);
+        self.screens.clear();
+        self.backend.unblank();
     }
 
-    /// Recreate the saver windows for the current monitor layout. The grab is on root and is
-    /// not affected. On failure the old windows are kept, the first one is stretched over the
-    /// current root geometry so nothing is left uncovered, and a retry is scheduled.
+    /// Recreate the surfaces for the current monitor layout; exclusive input is not affected.
+    /// On failure the backend keeps the old surfaces, stretched so nothing is left uncovered,
+    /// and a retry is scheduled.
     fn relayout(&mut self) -> Result<(), Box<dyn Error>> {
         self.next_relayout = None;
         let now = Instant::now();
-        let result = self
-            .current_monitors()
-            .and_then(|mons| match self.windows.relayout(&self.x, &mons) {
-                Ok(()) => Ok(mons.len()),
-                Err(e) => Err(e.into()),
-            });
-        match result {
+        match self.backend.relayout() {
             Ok(n) => log::info!("monitor layout changed: {n} monitor(s)"),
             Err(e) => {
                 log::error!("relayout failed ({e}); keeping old windows, retrying in 1 s");
                 self.next_relayout = Some(later(now, RELAYOUT_RETRY));
-                match self.root_monitor() {
-                    Ok(root) => {
-                        if let Err(e) = self.windows.cover_root(&self.x, root) {
-                            log::error!("cannot stretch saver window over the root: {e}");
-                        }
-                    }
-                    Err(e) => log::error!("cannot read root geometry: {e}"),
-                }
             }
         }
-        self.last_raise = Some(now);
         if self.grabbed {
-            // Cheap confirmation that the root grab survived.
-            match grab::reassert(&self.x, self.x.root) {
-                Ok(true) => self.mark_grab_seq(),
+            // Cheap confirmation that the grab survived.
+            match self.backend.check_exclusive() {
+                Ok(true) => {}
                 Ok(false) => self.grab_lost("re-grab after relayout failed"),
                 Err(e) => self.grab_lost(&format!("re-grab after relayout failed: {e}")),
             }
@@ -1738,63 +1289,29 @@ impl Daemon {
         }
     }
 
-    /// Write `_SCREENSAVER_STATUS` when the advertised state changed.
+    /// Publish the status when the advertised state changed.
     fn update_status(&mut self) {
         let want = self.desired_status();
         if want == self.status && !self.status_dirty {
             return;
         }
         let hack = self.current.map_or(0, |i| i as u32 + 1);
-        let hacks = vec![hack; self.windows.windows().len().max(1)];
+        let hacks = vec![hack; self.backend.surfaces().len().max(1)];
         let locked = |s: Status| matches!(s, Status::Lock | Status::Auth);
         let since = if want == self.status || (locked(want) && locked(self.status)) {
             self.status_since
         } else {
             SystemTime::now()
         };
-        match write_status(&self.x, self.status_root, want, since, &hacks) {
-            Ok(items) => {
+        match self.backend.publish_status(want, since, &hacks) {
+            Ok(()) => {
                 self.status_since = since;
                 self.status_dirty = false;
                 log::debug!("status {want:?} hacks {hacks:?}");
                 self.status = want;
-                self.status_items = items;
             }
             Err(e) => log::warn!("cannot set status: {e}"),
         }
-    }
-
-    /// `_SCREENSAVER_STATUS` changed on root: if it no longer holds exactly what we wrote last
-    /// (another client overwrote or deleted it), write our value back.
-    fn verify_status(&mut self) {
-        if self.status_items.is_empty() {
-            return;
-        }
-        let ours = match protocol::read_status(&self.x.conn, self.status_root, &self.x.atoms) {
-            Ok(protocol::RawStatus::Items(v)) => v == self.status_items,
-            Ok(_) => false,
-            Err(e) => {
-                log::debug!("cannot read status: {e}");
-                return;
-            }
-        };
-        if ours {
-            return;
-        }
-        log::warn!("_SCREENSAVER_STATUS changed by another client: restoring it");
-        let Some(atom) = self.x.atoms.by_name(protocol::ATOM_STATUS) else {
-            return;
-        };
-        if let Err(e) = self.x.conn.change_property32(
-            PropMode::REPLACE,
-            self.status_root,
-            atom,
-            AtomEnum::INTEGER,
-            &self.status_items,
-        ) {
-            log::warn!("cannot restore status: {e}");
-        }
-        self.x.flush();
     }
 
     fn dialog_visible(&self) -> bool {
@@ -1832,7 +1349,7 @@ impl Daemon {
         let dialog_on = dialog_screen(&self.screens);
         let show_dialog = self.state == SaverState::Locked && self.grabbed;
         let not_locked = self.lock_pending && !self.grabbed;
-        let no_keyboard = self.keyboard.is_none();
+        let no_keyboard = !self.backend.has_keyboard();
         let dark = self.dark();
         for (i, s) in self.screens.iter_mut().enumerate() {
             s.fb.clear();
@@ -1858,72 +1375,32 @@ impl Daemon {
                 // keystrokes may reach it.
                 draw_notice(&mut s.fb, "NOT LOCKED: another program holds the keyboard or mouse", now);
             }
-            s.presenter.present(&self.x, s.win, &s.fb)?;
+            self.backend.present(s.surface, &s.fb)?;
         }
         log::trace!("frame dt={}ms", dt.as_millis());
         self.next_frame = self.frame_interval().map(|iv| later(now, iv));
         Ok(())
     }
 
-    fn present_window(&mut self, win: Window) -> Result<(), Box<dyn Error>> {
-        if let Some(s) = self.screens.iter_mut().find(|s| s.win == win) {
-            s.presenter.present(&self.x, s.win, &s.fb)?;
+    fn present_surface(&mut self, surface: SurfaceId) -> Result<(), Box<dyn Error>> {
+        if let Some(s) = self.screens.iter().find(|s| s.surface == surface) {
+            self.backend.present(s.surface, &s.fb)?;
         }
         Ok(())
     }
 
     // -----------------------------------------------------------------------
-    // DPMS (untestable on Xvfb: it has no DPMS extension)
+    // Monitor power: the backend's (DPMS) when it has any, else the software stand-in
     // -----------------------------------------------------------------------
     fn dpms_activate(&mut self) {
-        if !self.x.has_dpms {
+        if !self.has_power {
             self.arm_soft_off(true);
             return;
         }
         if !self.cfg.dpms.enabled {
             return;
         }
-        let c = &self.x.conn;
-        let saved = (|| -> Option<SavedDpms> {
-            let t = dpms::get_timeouts(c).ok()?.reply().ok()?;
-            let i = dpms::info(c).ok()?.reply().ok()?;
-            Some(SavedDpms {
-                standby: t.standby_timeout,
-                suspend: t.suspend_timeout,
-                off: t.off_timeout,
-                enabled: i.state,
-            })
-        })();
-        if saved.is_none() {
-            log::warn!("cannot read DPMS settings; leaving DPMS alone");
-            return;
-        }
-        if self.dpms_saved.is_none() {
-            self.dpms_saved = saved;
-        }
-        let d = &self.cfg.dpms;
-        let _ = dpms::set_timeouts(c, secs_u16(d.standby), secs_u16(d.suspend), secs_u16(d.off));
-        let _ = dpms::enable(c);
-        if d.quick_off {
-            let _ = dpms::force_level(c, dpms::DPMSMode::OFF);
-        }
-        self.x.flush();
-        log::debug!("DPMS timeouts set, saved {:?}", self.dpms_saved);
-    }
-
-    fn dpms_enabled_on_server(&self) -> bool {
-        self.x.has_dpms
-            && dpms::info(&self.x.conn)
-                .ok()
-                .and_then(|c| c.reply().ok())
-                .is_some_and(|i| i.state)
-    }
-
-    fn dpms_on(&self) {
-        if self.dpms_enabled_on_server() {
-            let _ = dpms::force_level(&self.x.conn, dpms::DPMSMode::ON);
-            self.x.flush();
-        }
+        self.backend.power_install(&self.cfg.dpms);
     }
 
     /// True while frames must be pure black. A pending lock keeps the pattern running so
@@ -1932,13 +1409,13 @@ impl Daemon {
         self.soft_off && !self.lock_pending
     }
 
-    /// (Re)start the software power-off timer on a server without DPMS. `blanking` is true
+    /// (Re)start the software power-off timer on a display without power control. `blanking` is true
     /// when the screen has just been blanked, which is the only moment `quick_off` applies
     /// (with real DPMS it forces the monitor off once and the timeouts take over after a
     /// wake-up).
     fn arm_soft_off(&mut self, blanking: bool) {
         self.soft_off_deadline = None;
-        if self.x.has_dpms || self.state == SaverState::Idle {
+        if self.has_power || self.state == SaverState::Idle {
             return;
         }
         match soft_off_delay(&self.cfg.dpms, blanking) {
@@ -1964,8 +1441,8 @@ impl Daemon {
     /// Wake the display for the user: force a DPMS monitor on, or end the software
     /// power-off and start its timer again, as the server's idle timeouts would.
     fn wake_display(&mut self) {
-        self.dpms_on();
-        if self.x.has_dpms || self.state == SaverState::Idle {
+        self.backend.power_on();
+        if self.has_power || self.state == SaverState::Idle {
             return;
         }
         let was_off = std::mem::replace(&mut self.soft_off, false);
@@ -1979,29 +1456,18 @@ impl Daemon {
     }
 
     fn dpms_off(&mut self) {
-        if !self.x.has_dpms {
+        if !self.has_power {
             self.soft_power_off("SUSPEND");
             return;
         }
-        let _ = dpms::enable(&self.x.conn);
-        let _ = dpms::force_level(&self.x.conn, dpms::DPMSMode::OFF);
-        self.x.flush();
+        self.backend.power_off();
     }
 
     fn restore_dpms(&mut self) {
-        if !self.x.has_dpms {
+        if !self.has_power {
             return;
         }
-        self.dpms_on();
-        if let Some(s) = self.dpms_saved.take() {
-            let c = &self.x.conn;
-            let _ = dpms::set_timeouts(c, s.standby, s.suspend, s.off);
-            if !s.enabled {
-                let _ = dpms::disable(c);
-            }
-            self.x.flush();
-            log::debug!("DPMS settings restored");
-        }
+        self.backend.power_restore();
     }
 
     // -----------------------------------------------------------------------
@@ -2115,81 +1581,12 @@ fn suspend_allowed(state: SaverState, lock_pending: bool) -> bool {
 }
 
 
-/// Short name of an event for trace logs (never formats key data).
-fn event_name(ev: &Event) -> &'static str {
-    match ev {
-        Event::UnmapNotify(_) => "UnmapNotify",
-        Event::MapNotify(_) => "MapNotify",
-        Event::DestroyNotify(_) => "DestroyNotify",
-        Event::ConfigureNotify(_) => "ConfigureNotify",
-        Event::FocusIn(_) => "FocusIn",
-        Event::FocusOut(_) => "FocusOut",
-        Event::KeyPress(_) => "KeyPress",
-        Event::ButtonPress(_) => "ButtonPress",
-        Event::MotionNotify(_) => "MotionNotify",
-        Event::PropertyNotify(_) => "PropertyNotify",
-        Event::VisibilityNotify(_) => "VisibilityNotify",
-        _ => "other",
-    }
-}
-
-/// `--demo-blank`: blank every monitor for 3 s with a small grey marker in each monitor's
-/// top-left corner, then restore. Exercises connection, monitors, saver windows, grabs and
-/// presenting. Owner: Opus A. Fails if the server reports any X error during setup.
+/// `--demo-blank` (debug): black windows on every monitor for 3 seconds, then exit.
 pub fn demo_blank(display: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     if wayland_session() {
         return Err(WAYLAND_UNSUPPORTED.into());
     }
-    use crate::render::Framebuffer;
-    use crate::x11::{X11Error, conn::X11, grab, monitors, present::Presenter, saver_window::SaverWindows};
-    use x11rb::protocol::Event;
-
-    fn drain_errors(x: &X11) -> Result<(), X11Error> {
-        while let Some(ev) = x.poll_event()? {
-            if let Event::Error(e) = ev {
-                return Err(X11Error::Protocol(format!("{e:?}")));
-            }
-        }
-        Ok(())
-    }
-
-    let x = X11::open(display)?;
-    let mons = monitors::monitors(&x)?;
-    log::info!("demo-blank: {} monitor(s): {mons:?}", mons.len());
-    let mut wins = SaverWindows::create(&x, &mons)?;
-    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        wins.map_and_raise(&x)?;
-        drain_errors(&x)?;
-        let first = wins.windows().first().map(|&(w, _)| w).ok_or("no saver windows")?;
-        grab::grab_all(&x, first, std::time::Duration::from_secs(5))?;
-        let paint = (|| -> Result<(), Box<dyn std::error::Error>> {
-            let mut presenter: Option<Presenter> = None;
-            for &(w, m) in wins.windows() {
-                let (fw, fh) = (u32::from(m.width), u32::from(m.height));
-                let mut fb = Framebuffer::new(fw, fh);
-                fb.fill_rect(8, 8, 32, 32, crate::render::rgb(0x40, 0x40, 0x40));
-                let p = match presenter.as_mut() {
-                    Some(p) => {
-                        p.ensure_size(&x, fw, fh)?;
-                        p
-                    }
-                    None => presenter.insert(Presenter::new(&x, fw, fh)?),
-                };
-                p.present(&x, w, &fb)?;
-            }
-            x.sync()?;
-            drain_errors(&x)?;
-            std::thread::sleep(std::time::Duration::from_secs(3));
-            if let Some(p) = presenter {
-                p.destroy(&x);
-            }
-            Ok(())
-        })();
-        grab::ungrab_all(&x);
-        paint
-    })();
-    wins.destroy(&x);
-    result
+    crate::x11::backend::demo_blank(display)
 }
 
 #[cfg(test)]
