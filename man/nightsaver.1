@@ -175,7 +175,20 @@ the monitor is powered off immediately.
 On unblanking the monitor is forced on and the saved settings are restored.
 .Li nightsaver-command -suspend
 powers the monitor off immediately.
-Without the DPMS extension these steps are skipped.
+.Pp
+On an X server without the DPMS extension (framebuffer drivers such as scfb,
+and Xvfb) the monitor cannot be powered off.
+.Nm
+then shows a pure black screen instead: after the shortest non-zero configured
+timeout, immediately with
+.Va dpms.quick_off ,
+and on
+.Li nightsaver-command -suspend .
+Activity unblanks as usual; while locked, a key press or pointer movement
+brings the pattern and the unlock dialog back and restarts the timeout.
+The
+.Dq NOT LOCKED
+notice of a pending lock is always shown.
 .Pp
 DPMS has not yet been tested on real hardware.
 .Ss Configuration reload

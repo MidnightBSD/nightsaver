@@ -163,6 +163,12 @@ The server's previous settings are restored on unblanking.
 .It Va quick_off No (boolean, default false)
 Power the monitor off immediately when blanking.
 .El
+.Pp
+On an X server without the DPMS extension the screen turns pure black instead
+of powering off: after the shortest non-zero timeout above, or immediately with
+.Va quick_off .
+See
+.Xr nightsaver 1 .
 .Ss The [oled] table
 .Bl -tag -width indent
 .It Va max_brightness No (float, default 0.35)

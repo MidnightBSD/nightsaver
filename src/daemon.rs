@@ -316,6 +316,11 @@ struct Daemon {
     motion_last: Option<(i32, i32)>,
     motion_accum: f64,
     dpms_saved: Option<SavedDpms>,
+    /// Software stand-in for DPMS "off" on servers without the extension: frames are pure
+    /// black instead of the pattern (see `soft_off_delay`). Cleared by waking and unblanking.
+    soft_off: bool,
+    /// When the stand-in engages; only armed while blanked on a server without DPMS.
+    soft_off_deadline: Option<Instant>,
 }
 
 /// Run the daemon until EXIT (returns Ok) or a fatal X error. RESTART re-execs and only
@@ -411,8 +416,8 @@ pub fn run(args: Args, cfg: Config) -> Result<(), Box<dyn Error>> {
     if cfg.splash {
         log::info!("splash disabled in nightsaver");
     }
-    if !x.has_dpms {
-        log::info!("no DPMS extension: display power management is not available");
+    if !x.has_dpms && cfg.dpms.enabled {
+        log::info!("no DPMS extension: the screen goes black instead of powering off");
     }
 
     let now = Instant::now();
@@ -457,6 +462,8 @@ pub fn run(args: Args, cfg: Config) -> Result<(), Box<dyn Error>> {
         motion_last: None,
         motion_accum: 0.0,
         dpms_saved: None,
+        soft_off: false,
+        soft_off_deadline: None,
     };
 
     match d.event_loop()? {
@@ -649,6 +656,7 @@ impl Daemon {
         }
         t = min_opt(t, self.lock_deadline);
         t = min_opt(t, self.cycle_deadline);
+        t = min_opt(t, self.soft_off_deadline);
         t = min_opt(t, self.next_frame);
         t = min_opt(t, self.next_grab_retry);
         t = min_opt(t, self.next_grab_reassert);
@@ -736,6 +744,9 @@ impl Daemon {
                 if self.cycle_deadline.is_some_and(|t| now >= t) {
                     self.cycle_deadline = now.checked_add(self.cfg.cycle);
                     self.cycle_pattern();
+                }
+                if self.soft_off_deadline.is_some_and(|t| now >= t) {
+                    self.soft_power_off("DPMS timeout");
                 }
                 if self.state == SaverState::Locked
                     && let Some(l) = self.locker.as_mut()
@@ -882,9 +893,14 @@ impl Daemon {
                     SaverState::Locked => {
                         if !self.grabbed {
                             log::trace!("KeyPress without grab ignored");
-                        } else if let (Some(kb), Some(l)) =
-                            (self.keyboard.as_mut(), self.locker.as_mut())
-                        {
+                        } else if self.keyboard.is_some() && self.locker.is_some() {
+                            // A real DPMS monitor wakes on the key by itself; the software
+                            // power-off has to be ended here.
+                            self.wake_display();
+                            let (Some(kb), Some(l)) = (self.keyboard.as_mut(), self.locker.as_mut())
+                            else {
+                                return Ok(None);
+                            };
                             let input = lockapi::translate(kb, k);
                             let le = lockapi::key(l, input, Instant::now());
                             self.handle_lock_event(le)?;
@@ -981,7 +997,7 @@ impl Daemon {
 
     /// Pointer activity or DEACTIVATE while locked: wake the display and show the prompt.
     fn wake_locked(&mut self) -> Result<(), Box<dyn Error>> {
-        self.dpms_on();
+        self.wake_display();
         if self.grabbed
             && let Some(l) = self.locker.as_mut()
         {
@@ -1097,7 +1113,7 @@ impl Daemon {
                         // A lock is waiting for the grab: behave as if locked.
                         log::info!("DEACTIVATE while a lock is pending: keeping the screen blanked");
                         self.respond(true, "deactivating");
-                        self.dpms_on();
+                        self.wake_display();
                     }
                     SaverState::Blanked => {
                         self.respond(true, "deactivating");
@@ -1532,8 +1548,16 @@ impl Daemon {
                     "cannot grab keyboard and pointer: lock pending, staying blanked until the grab succeeds"
                 );
             }
-            self.lock_pending = true;
+            let newly_pending = !std::mem::replace(&mut self.lock_pending, true);
             self.lock_deadline = None;
+            if newly_pending {
+                // The "NOT LOCKED" notice must appear now, also when nothing else would draw
+                // a frame (blank pattern, software power-off).
+                self.schedule_frames();
+                if let Err(e) = self.render() {
+                    log::warn!("render failed: {e}");
+                }
+            }
             return false;
         }
         if self.keyboard.is_none() {
@@ -1581,6 +1605,8 @@ impl Daemon {
         }
         self.teardown_windows();
         self.restore_dpms();
+        self.soft_off = false;
+        self.soft_off_deadline = None;
         self.state = SaverState::Idle;
         self.locker = None;
         self.lock_deadline = None;
@@ -1749,10 +1775,15 @@ impl Daemon {
     }
 
     fn frame_interval(&self) -> Option<Duration> {
-        let wants = self.screens.first().map_or(0, |s| s.pattern.wants_fps());
+        // A dark screen has nothing to animate: draw it once, like the blank pattern.
+        let wants = if self.dark() { 0 } else { self.screens.first().map_or(0, |s| s.pattern.wants_fps()) };
         let mut fps = if wants == 0 { 0 } else { wants.min(self.cfg.fps).max(1) };
         if self.dialog_visible() {
             fps = fps.max(MIN_DIALOG_FPS);
+        }
+        if self.lock_pending && !self.grabbed {
+            // Keep the "NOT LOCKED" notice drawn and drifting even over a still pattern.
+            fps = fps.max(1);
         }
         (fps > 0).then(|| Duration::from_secs(1) / fps)
     }
@@ -1772,11 +1803,16 @@ impl Daemon {
         let show_dialog = self.state == SaverState::Locked && self.grabbed;
         let not_locked = self.lock_pending && !self.grabbed;
         let no_keyboard = self.keyboard.is_none();
+        let dark = self.dark();
         for (i, s) in self.screens.iter_mut().enumerate() {
             s.fb.clear();
-            s.pattern.step(dt, &mut s.fb, &mut s.rng);
-            s.oled.tick(dt);
-            s.oled.apply(&mut s.fb);
+            // Software power-off: leave the frame pure black. The dialog and the notice
+            // below are still drawn, so the lock state is never hidden.
+            if !dark {
+                s.pattern.step(dt, &mut s.fb, &mut s.rng);
+                s.oled.tick(dt);
+                s.oled.apply(&mut s.fb);
+            }
             // The dialog is drawn after the OLED pass, so the rest interlude never blanks it
             // while the user is typing (it is short-lived and dim already).
             if show_dialog && i == dialog_on {
@@ -1810,7 +1846,11 @@ impl Daemon {
     // DPMS (untestable on Xvfb: it has no DPMS extension)
     // -----------------------------------------------------------------------
     fn dpms_activate(&mut self) {
-        if !self.cfg.dpms.enabled || !self.x.has_dpms {
+        if !self.x.has_dpms {
+            self.arm_soft_off(true);
+            return;
+        }
+        if !self.cfg.dpms.enabled {
             return;
         }
         let c = &self.x.conn;
@@ -1856,9 +1896,61 @@ impl Daemon {
         }
     }
 
-    fn dpms_off(&self) {
+    /// True while frames must be pure black. A pending lock keeps the pattern running so
+    /// its "NOT LOCKED" notice stays animated and obvious.
+    fn dark(&self) -> bool {
+        self.soft_off && !self.lock_pending
+    }
+
+    /// (Re)start the software power-off timer on a server without DPMS. `blanking` is true
+    /// when the screen has just been blanked, which is the only moment `quick_off` applies
+    /// (with real DPMS it forces the monitor off once and the timeouts take over after a
+    /// wake-up).
+    fn arm_soft_off(&mut self, blanking: bool) {
+        self.soft_off_deadline = None;
+        if self.x.has_dpms || self.state == SaverState::Idle {
+            return;
+        }
+        match soft_off_delay(&self.cfg.dpms, blanking) {
+            Some(d) if d.is_zero() => self.soft_off = true,
+            Some(d) => self.soft_off_deadline = Instant::now().checked_add(d),
+            None => {}
+        }
+    }
+
+    /// Stand-in for DPMS "off": stop drawing the pattern and show pure black.
+    fn soft_power_off(&mut self, why: &str) {
+        self.soft_off_deadline = None;
+        if self.state == SaverState::Idle || self.soft_off {
+            return;
+        }
+        self.soft_off = true;
+        log::info!("{why}: no DPMS extension, showing a black screen instead");
+        if let Err(e) = self.render() {
+            log::warn!("render failed: {e}");
+        }
+    }
+
+    /// Wake the display for the user: force a DPMS monitor on, or end the software
+    /// power-off and start its timer again, as the server's idle timeouts would.
+    fn wake_display(&mut self) {
+        self.dpms_on();
+        if self.x.has_dpms || self.state == SaverState::Idle {
+            return;
+        }
+        let was_off = std::mem::replace(&mut self.soft_off, false);
+        self.arm_soft_off(false);
+        if was_off {
+            self.last_frame = Instant::now();
+            if let Err(e) = self.render() {
+                log::warn!("render failed: {e}");
+            }
+        }
+    }
+
+    fn dpms_off(&mut self) {
         if !self.x.has_dpms {
-            log::info!("SUSPEND: no DPMS extension, display stays blanked");
+            self.soft_power_off("SUSPEND");
             return;
         }
         let _ = dpms::enable(&self.x.conn);
@@ -1924,6 +2016,9 @@ impl Daemon {
             if self.cycle_deadline.is_some() {
                 self.cycle_deadline = (!self.cfg.cycle.is_zero()).then(|| now.checked_add(self.cfg.cycle)).flatten();
             }
+            if !self.soft_off {
+                self.arm_soft_off(false);
+            }
         }
     }
 }
@@ -1963,6 +2058,21 @@ fn pick_dialog(screens: &[(u32, u32, bool)]) -> usize {
         .enumerate()
         .max_by_key(|(_, s)| u64::from(s.0) * u64::from(s.1))
         .map_or(0, |(i, _)| i)
+}
+
+/// How long after blanking (or after a wake-up) a server without DPMS should go black, as
+/// the stand-in for powering the monitor off: `None` when DPMS management is disabled,
+/// zero for `quick_off` at the moment of blanking, else the shortest non-zero timeout
+/// (on a real monitor the first DPMS stage already removes the picture; zero means
+/// "never" for a DPMS timeout).
+fn soft_off_delay(dpms: &crate::config::DpmsConfig, blanking: bool) -> Option<Duration> {
+    if !dpms.enabled {
+        return None;
+    }
+    if blanking && dpms.quick_off {
+        return Some(Duration::ZERO);
+    }
+    [dpms.standby, dpms.suspend, dpms.off].into_iter().filter(|d| !d.is_zero()).min()
 }
 
 /// SUSPEND may not power the display off while the user must authenticate or while a lock
@@ -2050,7 +2160,9 @@ pub fn demo_blank(display: Option<&str>) -> Result<(), Box<dyn std::error::Error
 
 #[cfg(test)]
 mod dialog_tests {
-    use super::{SaverState, pick_dialog, suspend_allowed};
+    use super::{SaverState, pick_dialog, soft_off_delay, suspend_allowed};
+    use crate::config::DpmsConfig;
+    use std::time::Duration;
 
     #[test]
     fn primary_wins_only_when_big_enough() {
@@ -2059,6 +2171,22 @@ mod dialog_tests {
         assert_eq!(pick_dialog(&[(1920, 1080, false), (4, 4, true)]), 0);
         assert_eq!(pick_dialog(&[(100, 100, false), (200, 150, false)]), 1);
         assert_eq!(pick_dialog(&[]), 0);
+    }
+
+    #[test]
+    fn soft_off_delay_follows_the_dpms_settings() {
+        let s = Duration::from_secs;
+        let mut d = DpmsConfig { enabled: false, standby: s(600), suspend: s(900), off: s(1200), quick_off: true };
+        assert_eq!(soft_off_delay(&d, true), None, "disabled: never");
+        d.enabled = true;
+        assert_eq!(soft_off_delay(&d, true), Some(Duration::ZERO), "quick_off applies when blanking");
+        assert_eq!(soft_off_delay(&d, false), Some(s(600)), "after a wake-up the timeouts apply");
+        d.quick_off = false;
+        assert_eq!(soft_off_delay(&d, true), Some(s(600)), "shortest timeout");
+        d.standby = Duration::ZERO;
+        assert_eq!(soft_off_delay(&d, true), Some(s(900)), "zero means never for that stage");
+        (d.suspend, d.off) = (Duration::ZERO, Duration::ZERO);
+        assert_eq!(soft_off_delay(&d, true), None, "all stages off");
     }
 
     #[test]
