@@ -1,4 +1,4 @@
-.Dd November 8, 2026
+.Dd November 14, 2026
 .Dt NIGHTSAVER.TOML 5
 .Os
 .Sh NAME
@@ -64,6 +64,8 @@ Negative values are rejected.
 .Bl -tag -width indent
 .It Va display No (string, default Dv $DISPLAY )
 X display to manage.
+Not used by the Wayland backend, which connects to
+.Ev WAYLAND_DISPLAY .
 .It Va backend No (string, default Qq auto )
 Display system:
 .Qq auto ,
@@ -184,6 +186,14 @@ of powering off: after the shortest non-zero timeout above, or immediately with
 .Va quick_off .
 See
 .Xr nightsaver 1 .
+.Pp
+A Wayland compositor has no power timeouts to configure, so there the daemon
+itself switches the outputs off after the shortest non-zero timeout above
+(or immediately with
+.Va quick_off )
+and on again at the next activity.
+This needs the wlr-output-power-management protocol; without it the screen
+turns pure black in the same way.
 .Ss The [oled] table
 .Bl -tag -width indent
 .It Va max_brightness No (float, default 0.35)

@@ -1,4 +1,7 @@
-# nightsaver — Rust Xorg screensaver + locker, xscreensaver drop-in
+# nightsaver — Rust screensaver + locker for Xorg and Wayland, xscreensaver drop-in
+
+This document is the original Xorg design, kept as written. Wayland support was added later;
+see "Wayland" at the end for how it fits in.
 
 ## Context
 
@@ -122,3 +125,39 @@ wait for `_SCREENSAVER_RESPONSE` the same way xscreensaver does; `-time`/`-watch
    right password. Multi-monitor coverage. DPMS state via `xset q`.
 4. Config reload: edit `~/.xscreensaver` `timeout:` while running → takes effect without restart.
 5. Security review: no path unmaps or exits while Locked; password zeroized; grabs verified before prompting.
+
+## Wayland (added in 0.6.0)
+
+One binary, two backends, chosen at run time (`backend = auto | x11 | wayland`; `auto` picks Wayland
+when `WAYLAND_DISPLAY` is set). The daemon keeps all policy and reaches the display only through
+`display::Backend`; `src/x11/backend.rs` and `src/wayland/mod.rs` implement it.
+
+- **Which compositors.** Only `ext-session-lock-v1` gives a client a real lock, so locking works on
+  wlroots compositors (sway, labwc). KWin has layer-shell and idle-notify but no session lock: the
+  saver runs blank-only there, `-lock` is refused and status never reports LOCK. Mutter has neither
+  and is refused at start with the missing protocols named.
+- **XWayland is never trusted to lock.** An X grab does not keep input from native Wayland clients,
+  so forcing `--backend x11` while `WAYLAND_DISPLAY` is set disables locking.
+- **Blanking** uses `wlr-layer-shell` overlay surfaces with exclusive keyboard interactivity, one per
+  output. **Locking** creates a session lock and a lock surface per output.
+- **Lock invariants.** Locked is entered only on the compositor's `locked` event. A lock that was
+  requested but not confirmed (another locker holds the session) is pending: shown as NOT LOCKED,
+  retried, and it refuses EXIT/RESTART/DEACTIVATE/SUSPEND and SIGTERM like a pending X grab.
+  `unlock_and_destroy` is called only in `Backend::release_exclusive`, reached only when not locked or
+  after the helper's clean `exit(0)`. If the daemon dies, the compositor keeps the session locked.
+- **Idle** comes from `ext-idle-notify-v1`, so the compositor's idle inhibitors (video players) are
+  honoured. **Power** uses `wlr-output-power-management`, timed by the backend because there are no
+  DPMS timeouts to install; without it the black-screen fallback applies.
+- **Rendering.** `Framebuffer` pixels (0x00RRGGBB, little-endian) are exactly `wl_shm` XRGB8888.
+  Buffers are anonymous shared memory filled with positioned file writes; nothing is mapped.
+  Integer output scale only.
+- **Control.** `xscreensaver-command` needs X properties, so the daemon also listens on
+  `$XDG_RUNTIME_DIR/nightsaver-<display>.sock` (mode 0600, same-uid peers only, runtime directory
+  must be ours and 0700). `nightsaver-command` uses it under Wayland or with `-socket`. Socket
+  commands go through `Daemon::command`, the same function as X ones.
+- **Crates.** `wayland-client` (pure Rust, no libwayland), `wayland-protocols`,
+  `wayland-protocols-wlr`, the `wayland` feature of `xkbcommon`; `wayland-protocols-misc` is a
+  dev-dependency for the test keyboard only.
+- **Testing.** `tests/wayland_smoke.sh` runs a private headless sway with a virtual pointer and
+  keyboard and a stand-in auth helper. Not covered: PAM and a real keyboard under Wayland, KWin,
+  GNOME, real hardware, fractional scaling, multiple seats.
