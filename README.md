@@ -4,7 +4,10 @@ An OLED-friendly Xorg screensaver and PAM screen locker for MidnightBSD, written
 It is a drop-in replacement for the `xscreensaver` daemon and the `xscreensaver-command`
 control client.
 
-Status: **v0.5, Xorg only.** There is no Wayland support.
+Status: **v0.6, Xorg only.** There is no Wayland support yet. In a Wayland session
+(`WAYLAND_DISPLAY` set) nightsaver refuses to start rather than run on XWayland, where it could
+blank the screen but not lock native Wayland clients; `--backend x11` forces it to run there with
+locking disabled.
 
 ## Features
 
@@ -113,6 +116,7 @@ re-read within about five seconds of a change, or immediately on `kill -HUP`.
 ```
 nightsaver [-display host:display.screen] [-verbose] [-quiet] [-no-splash] [-log file]
            [-debug] [-sync] [--lock | --no-lock] [--config file] [--pattern name]
+           [--backend auto|x11|wayland]
 ```
 
 Also: `-dpy`, `-disp`, `-v`/`-vv`/`-vvv`/`-vvvv`, `-nosplash`, `-splash` (ignored), `-version`,

@@ -20,6 +20,8 @@ pub struct Args {
     pub lock: Option<bool>,
     pub config_path: Option<PathBuf>,
     pub pattern: Option<String>,
+    /// `--backend auto|x11|wayland` as typed; validated by `config::Backend::parse`.
+    pub backend: Option<String>,
     pub demo_blank: bool,
 }
 
@@ -28,7 +30,7 @@ pub struct Args {
     name = "nightsaver",
     about = "OLED-friendly Xorg screensaver and screen locker (xscreensaver compatible)",
     disable_version_flag = true,
-    override_usage = "nightsaver [-display host:display.screen] [-verbose] [-quiet] [-no-splash] [-log file] [-debug] [-sync] [--lock] [--config file] [--pattern name]"
+    override_usage = "nightsaver [-display host:display.screen] [-verbose] [-quiet] [-no-splash] [-log file] [-debug] [-sync] [--lock] [--config file] [--pattern name] [--backend auto|x11|wayland]"
 )]
 struct Raw {
     /// X display to manage
@@ -70,12 +72,15 @@ struct Raw {
     /// Force a single pattern by name
     #[arg(long)]
     pattern: Option<String>,
+    /// Display backend: auto, x11 or wayland
+    #[arg(long)]
+    backend: Option<String>,
     /// Debug: map black windows for 3 seconds and exit
     #[arg(long = "demo-blank")]
     demo_blank: bool,
 }
 
-const VALUE_FLAGS: &[&str] = &["--display", "--log", "--config", "--pattern"];
+const VALUE_FLAGS: &[&str] = &["--display", "--log", "--config", "--pattern", "--backend"];
 
 /// Rewrite xscreensaver spellings (`-dpy`, `-vvv`, `-nosplash`, ...) into the canonical
 /// double-dash forms understood by clap. Unknown arguments pass through untouched.
@@ -112,6 +117,7 @@ fn normalize(args: Vec<String>) -> Vec<String> {
             "no-lock" => Some("--no-lock"),
             "config" => Some("--config"),
             "pattern" => Some("--pattern"),
+            "backend" => Some("--backend"),
             "demo-blank" => Some("--demo-blank"),
             _ => None,
         };
@@ -199,6 +205,7 @@ fn try_parse<I: IntoIterator<Item = String>>(args: I) -> Outcome {
         lock,
         config_path: raw.config,
         pattern: raw.pattern,
+        backend: raw.backend,
         demo_blank: raw.demo_blank,
     })
 }
@@ -282,6 +289,14 @@ mod tests {
         assert_eq!(a.config_path, Some(PathBuf::from("/c.toml")));
         assert_eq!(a.pattern.as_deref(), Some("clock"));
         assert_eq!(p("--no-lock").unwrap().lock, Some(false));
+    }
+
+    #[test]
+    fn backend_flag() {
+        assert_eq!(p("-no-splash").unwrap().backend, None);
+        assert_eq!(p("--backend x11").unwrap().backend.as_deref(), Some("x11"));
+        assert_eq!(p("-backend wayland -v").unwrap().backend.as_deref(), Some("wayland"));
+        assert_eq!(p("--backend=auto").unwrap().backend.as_deref(), Some("auto"));
     }
 
     #[test]

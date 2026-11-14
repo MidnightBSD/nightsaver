@@ -37,7 +37,7 @@ use x11rb::wrapper::ConnectionExt as _;
 
 use crate::cli::Args;
 use crate::compat::protocol::{self, Command, Status};
-use crate::config::{Config, Mode};
+use crate::config::{Config, Mode, ResolvedBackend, resolve_backend, wayland_session};
 use crate::patterns::{self, Pattern, Rng};
 use crate::render::Framebuffer;
 use crate::render::oled::OledGuard;
@@ -321,11 +321,29 @@ struct Daemon {
     soft_off: bool,
     /// When the stand-in engages; only armed while blanked on a server without DPMS.
     soft_off_deadline: Option<Instant>,
+    /// False when this X server is XWayland (a Wayland session is running): grabs there
+    /// do not cover native Wayland clients, so nothing may ever be reported as locked.
+    lockable: bool,
 }
+
+/// Refusal when the Wayland backend is selected: there is none yet, and silently falling
+/// back to XWayland would blank and claim a lock that native Wayland clients ignore.
+const WAYLAND_UNSUPPORTED: &str = "Wayland is not supported yet; use --backend x11 to run on \
+     XWayland (it can blank the screen but cannot lock native Wayland clients)";
 
 /// Run the daemon until EXIT (returns Ok) or a fatal X error. RESTART re-execs and only
 /// returns on failure.
 pub fn run(args: Args, cfg: Config) -> Result<(), Box<dyn Error>> {
+    let lockable = match resolve_backend(cfg.backend, wayland_session()) {
+        ResolvedBackend::Wayland => return Err(WAYLAND_UNSUPPORTED.into()),
+        ResolvedBackend::X11 { lockable } => lockable,
+    };
+    if !lockable {
+        log::warn!(
+            "WAYLAND_DISPLAY is set: this X server is XWayland, which cannot lock native \
+             Wayland clients; locking is disabled and the screen will only be blanked"
+        );
+    }
     let x = X11::open(cfg.display.as_deref())?;
     let display_name = cfg
         .display
@@ -464,6 +482,7 @@ pub fn run(args: Args, cfg: Config) -> Result<(), Box<dyn Error>> {
         dpms_saved: None,
         soft_off: false,
         soft_off_deadline: None,
+        lockable,
     };
 
     match d.event_loop()? {
@@ -1064,8 +1083,9 @@ impl Daemon {
     /// Locking needs a user name for PAM. A missing keyboard does not disable locking (L6):
     /// it is retried at lock time and, failing that, the screen locks anyway.
     fn can_lock(&self) -> bool {
-        // Locking never depends on the user lookup: see `lock_now` (fail closed).
-        true
+        // Locking never depends on the user lookup: see `lock_now` (fail closed). It does
+        // depend on the display being lockable at all (not XWayland).
+        self.lockable
     }
 
     /// Reply to a command once its action has finished: `+ok_msg`, or `-reason` on error (the
@@ -1169,7 +1189,7 @@ impl Daemon {
                 if self.state == SaverState::Locked {
                     self.respond(false, "already locked");
                 } else if !self.can_lock() {
-                    self.respond(false, "locking disabled");
+                    self.respond(false, "locking is not possible on XWayland");
                 } else {
                     // Reply only once the outcome is known: "+locking" means Locked, which in
                     // turn means both grabs are held. Otherwise the lock stays pending (status
@@ -1534,6 +1554,13 @@ impl Daemon {
             SaverState::Locked => return true,
             SaverState::Idle => return false,
             SaverState::Blanked => {}
+        }
+        if !self.lockable {
+            // Single choke point: whatever asked for the lock (command, lock timeout,
+            // --lock), an XWayland display is never reported as locked.
+            log::warn!("lock requested, but this display cannot be locked (XWayland): staying blanked");
+            self.lock_deadline = None;
+            return false;
         }
         if self.user.is_none() {
             // The lookup failed at startup (NIS/LDAP outage?); try once more now.
@@ -1988,6 +2015,7 @@ impl Daemon {
         };
         // The display and logging setup cannot change at runtime.
         new.display = self.cfg.display.clone();
+        new.backend = self.cfg.backend;
         if new == self.cfg {
             log::debug!("configuration unchanged");
             return;
@@ -2106,6 +2134,9 @@ fn event_name(ev: &Event) -> &'static str {
 /// top-left corner, then restore. Exercises connection, monitors, saver windows, grabs and
 /// presenting. Owner: Opus A. Fails if the server reports any X error during setup.
 pub fn demo_blank(display: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    if wayland_session() {
+        return Err(WAYLAND_UNSUPPORTED.into());
+    }
     use crate::render::Framebuffer;
     use crate::x11::{X11Error, conn::X11, grab, monitors, present::Presenter, saver_window::SaverWindows};
     use x11rb::protocol::Event;
