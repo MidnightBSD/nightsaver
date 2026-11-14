@@ -350,10 +350,11 @@ pub fn resolve_pam_service(service: &str, dirs: &[PathBuf]) -> String {
     }
 }
 
-/// Reasons, shared by the path-based pre-check (`untrusted_file`) and the open-handle check
-/// in [`read_trusted`]: a configuration file must be a regular file owned by us (or root)
-/// and not writable by group or others, because config selects the PAM service and may
-/// disable locking. Also used by `lock::throttle` to reject foreign-planted state files.
+/// Reason a file must not be trusted, or `None` if it is fine. Used by the open-handle
+/// check in [`read_trusted`]: a configuration file must be a regular file owned by us (or
+/// root) and not writable by group or others, because config selects the PAM service and
+/// may disable locking. The same rules gate the helper binary (`lock::helper`) and the
+/// throttle state file (`lock::throttle`).
 pub(crate) fn untrusted_metadata(md: &std::fs::Metadata) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: getuid has no preconditions and cannot fail.
@@ -369,11 +370,8 @@ pub(crate) fn untrusted_metadata(md: &std::fs::Metadata) -> Option<String> {
     }
 }
 
-/// Reason a configuration file must not be trusted, or `None` if it is fine (or absent).
-/// Used by the helper-exec trust check in `lock::helper` (audit finding F1), which resolves
-/// a path it will exec and therefore cannot read through an opened handle. Not called on
-/// the library paths of this commit; the file-reading callers use [`read_trusted`].
-#[allow(dead_code)]
+/// Path form of [`untrusted_metadata`] for the tests (`None` also when the path is absent).
+#[cfg(test)]
 pub(crate) fn untrusted_file(path: &std::path::Path) -> Option<String> {
     let md = std::fs::metadata(path).ok()?;
     untrusted_metadata(&md)

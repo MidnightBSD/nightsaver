@@ -4,7 +4,7 @@
 //! local process can run (`printf "xscreensaver\0me\0pw\0" | nightsaver-auth`), so nothing
 //! else stops a loop from hammering PAM: every attempt forks the setuid
 //! `unix-selfauth-helper` through `pam_exec`, whose crypt work is real CPU. The throttle
-//! serializes one invoking user's attempts on an fcntl lock for their whole attempt
+//! serializes one invoking user's attempts on a `flock` lock for their whole attempt
 //! (including PAM, which also caps concurrency at one transaction per uid) and enforces a
 //! minimum gap between attempt starts, recorded in the state file.
 //!
@@ -205,6 +205,21 @@ mod tests {
         dir
     }
 
+    /// Write a fixture state file with mode 0600 whatever the umask is: a group-writable
+    /// file (umask 002) is untrusted and would bypass the throttle instead of exercising it.
+    fn seed(path: &Path, content: &[u8]) -> File {
+        use std::io::Write as _;
+        let mut f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        f.write_all(content).unwrap();
+        f
+    }
+
     #[test]
     fn lock_path_is_per_uid_in_tmp() {
         let p = lock_path().to_string_lossy().into_owned();
@@ -236,7 +251,7 @@ mod tests {
         let dir = private_dir("contended");
         let path = dir.join("state.lock");
         // Hold the slot the way another in-flight attempt would.
-        let held = File::create(&path).unwrap();
+        let held = seed(&path, b"");
         // SAFETY: advisory flock on the fixture fd we just created.
         let rc = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) };
         assert_eq!(rc, 0, "fixture must hold the lock");
@@ -341,7 +356,7 @@ mod tests {
     fn unreadable_timestamp_fails_open() {
         let dir = private_dir("garbage");
         let path = dir.join("state.lock");
-        std::fs::write(&path, "not a timestamp").unwrap();
+        seed(&path, b"not a timestamp");
         assert!(attempt(&path, MAX_WAIT, || Ok(())).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -366,9 +381,8 @@ mod tests {
     fn hard_linked_state_file_fails_open_and_is_not_written() {
         let dir = private_dir("hardlink");
         let victim = dir.join("victim-data");
-        std::fs::write(&victim, b"precious contents\n").unwrap();
         // Hold a lock on it, the way a pidfile owner would: must not count as contention.
-        let held = File::open(&victim).unwrap();
+        let held = seed(&victim, b"precious contents\n");
         // SAFETY: advisory flock on the fixture fd we just opened.
         assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
         let path = dir.join("state.lock");
@@ -389,7 +403,7 @@ mod tests {
     fn long_garbage_is_truncated_and_the_gap_still_applies() {
         let dir = private_dir("tail");
         let path = dir.join("state.lock");
-        std::fs::write(&path, "garbage that is longer than any timestamp\n").unwrap();
+        seed(&path, b"garbage that is longer than any timestamp\n");
         attempt(&path, MAX_WAIT, || Ok(())).unwrap();
         let recorded = std::fs::read_to_string(&path).unwrap();
         assert!(recorded.trim().parse::<u64>().is_ok(), "stale tail left behind: {recorded:?}");
