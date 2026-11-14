@@ -25,7 +25,7 @@ src/config/                    merged Config: CLI > ~/.config/nightsaver/config.
 src/compat/protocol.rs         SCREENSAVER ClientMessage + _SCREENSAVER_* root/window properties
 src/x11/                       x11rb XCBConnection, monitors, saver windows, idle, grabs, present, keyboard
 src/render/                    Framebuffer (0x00RRGGBB), bitmap font, OLED post-pass
-src/patterns/                  trait Pattern + blank/clock/starfield/matrix/midnight/cat/juggler/puppy (+ assets/)
+src/patterns/                  trait Pattern + blank/clock/starfield/matrix/midnight/cat/juggler/puppy/penguin (+ assets/)
 src/lock/                      Locker state machine, helper-process auth, PAM FFI, unlock dialog
 src/daemon.rs                  event loop: Idle -> Blanked -> Locked
 etc/ man/ tests/ Makefile      packaging, man pages, Xvfb smoke test

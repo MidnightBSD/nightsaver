@@ -94,7 +94,7 @@ impl Default for Config {
             passwd_timeout: Duration::from_secs(30),
             pam_service: "xscreensaver".into(),
             mode: Mode::Random,
-            patterns: vec!["clock".into(), "starfield".into(), "matrix".into(), "midnight".into(), "cat".into(), "juggler".into(), "puppy".into()],
+            patterns: vec!["clock".into(), "starfield".into(), "matrix".into(), "midnight".into(), "cat".into(), "juggler".into(), "puppy".into(), "penguin".into()],
             selected: 0,
             fps: 30,
             motion_threshold_px: 10,
