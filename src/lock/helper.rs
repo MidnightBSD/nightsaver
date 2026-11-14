@@ -37,6 +37,8 @@ pub const LIBEXEC_DIR: &str = env!("NIGHTSAVER_LIBEXEC");
 pub const HELPER_TIMEOUT: Duration = Duration::from_secs(25);
 /// Longest stdout line we accept from the helper.
 const MAX_MESSAGE: usize = 256;
+/// Most helper stderr lines copied into the daemon log per attempt.
+const MAX_STDERR_LINES: usize = 8;
 
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_DENIED: i32 = 1;
@@ -175,6 +177,22 @@ fn first_line(out: &[u8]) -> String {
         .collect()
 }
 
+/// The helper's stderr as log-safe lines: control characters removed, each line and the
+/// number of lines bounded, empty lines dropped.
+fn stderr_lines(err: &[u8]) -> Vec<String> {
+    err.split(|b| *b == b'\n')
+        .map(|l| {
+            String::from_utf8_lossy(l)
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(MAX_MESSAGE)
+                .collect::<String>()
+        })
+        .filter(|l| !l.trim().is_empty())
+        .take(MAX_STDERR_LINES)
+        .collect()
+}
+
 /// Authenticate by running the helper. Same contract as `pam::authenticate`.
 pub fn authenticate(service: &str, user: &str, password: &Zeroizing<String>) -> Result<(), PamError> {
     if password.as_bytes().contains(&0) || service.contains('\0') || user.contains('\0') {
@@ -186,7 +204,7 @@ pub fn authenticate(service: &str, user: &str, password: &Zeroizing<String>) -> 
         .env("PATH", "/usr/bin:/bin:/usr/local/bin")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| PamError::System(format!("cannot run {}: {e}", helper.path.display())))?;
 
@@ -218,6 +236,17 @@ pub fn authenticate(service: &str, user: &str, password: &Zeroizing<String>) -> 
         buf
     });
 
+    // Same for stderr: the helper reports its own warnings there (e.g. a bypassed
+    // throttle), which would otherwise be lost. It never carries request data.
+    let mut stderr = child.stderr.take();
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(err) = stderr.as_mut() {
+            let _ = err.take(4096).read_to_end(&mut buf);
+        }
+        buf
+    });
+
     let started = Instant::now();
     let status = loop {
         match child.try_wait() {
@@ -235,6 +264,9 @@ pub fn authenticate(service: &str, user: &str, password: &Zeroizing<String>) -> 
         }
     };
     let out = reader.join().unwrap_or_default();
+    for line in stderr_lines(&err_reader.join().unwrap_or_default()) {
+        log::warn!("{HELPER_NAME}: {line}");
+    }
     if !helper_unchanged(&helper) {
         // The exit status may come from a swapped-in binary: refuse it. Killing is a no-op
         // once the child has exited; the wait only clears the process entry.
@@ -345,5 +377,14 @@ mod tests {
         // A deleted helper is also "not unchanged": nothing to trust.
         let _ = std::fs::remove_dir_all(&dir);
         assert!(!helper_unchanged(&pinned));
+    }
+
+    #[test]
+    fn helper_stderr_is_sanitised_and_bounded() {
+        let lines = stderr_lines(b"warn one\n\n\x1b[31mtwo\x07\n");
+        assert_eq!(lines, vec!["warn one".to_string(), "[31mtwo".to_string()]);
+        let many = "x\n".repeat(50);
+        assert_eq!(stderr_lines(many.as_bytes()).len(), MAX_STDERR_LINES);
+        assert!(stderr_lines(b"").is_empty());
     }
 }

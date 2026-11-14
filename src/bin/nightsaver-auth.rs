@@ -33,6 +33,8 @@ fn run() -> i32 {
         return EXIT_USAGE;
     }
     disable_core_dumps();
+    // Warnings (e.g. a bypassed throttle) go to stderr; the daemon copies them to its log.
+    let _ = nightsaver::logging::init(0, None);
 
     let mut raw = Zeroizing::new(Vec::new());
     if let Err(e) = stdin.lock().take(MAX_REQUEST).read_to_end(&mut raw) {

@@ -25,7 +25,13 @@
 //!   else bypasses the throttle and logs a warning. This is what keeps a planted `/tmp`
 //!   file (a 0666 seed another uid holds `flock` on, a FIFO, a device) from delaying or
 //!   refusing someone else's unlock attempt - without the check, contention would be
-//!   forgeable cross-uid.
+//!   forgeable cross-uid. It must also have exactly one link: where the kernel lets a user
+//!   hard-link files they do not own (`security.bsd.hardlink_check_uid=0`, the default),
+//!   another uid could otherwise make the state name an alias of any file of ours on the
+//!   `/tmp` filesystem, which passes the ownership rules, gets our timestamp written over
+//!   its first bytes, and forges contention if one of our processes holds a lock on it.
+//! - Warnings go through `log`; the helper installs a stderr logger and the daemon copies
+//!   the helper's stderr into its own log, so a bypassed throttle is visible.
 //! - Only *contention* — another attempt holding the slot longer than `MAX_WAIT` — is a
 //!   denial, and with the check above the holder can only be a process running as the same
 //!   user (or root, which can do anything anyway).
@@ -37,7 +43,7 @@
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -133,6 +139,16 @@ fn attempt<T>(
         );
         return f();
     }
+    // A second name for the file means the state path may be a hard link someone else
+    // planted to one of our own files (see the module comment): never lock or write it.
+    if md.nlink() != 1 {
+        log::warn!(
+            "throttle: {} has {} links, expected 1; running unthrottled",
+            path.display(),
+            md.nlink()
+        );
+        return f();
+    }
 
     // Acquire the slot; the lock rides on `file` and is released when it is dropped, i.e.
     // after `f` returns, and at process exit even when the helper is killed mid-PAM.
@@ -162,7 +178,10 @@ fn attempt<T>(
     if elapsed < MIN_GAP {
         std::thread::sleep(MIN_GAP - elapsed);
     }
-    // Record this attempt's start; a failed write must not block the attempt.
+    // Record this attempt's start; a failed write must not block the attempt. Truncate
+    // first: a longer leftover (tampered or garbage content) would otherwise keep its tail
+    // behind the new timestamp, never parse again, and switch the gap off for good.
+    let _ = file.set_len(0);
     let _ = file.write_all_at(format!("{}\n", now_millis()).as_bytes(), 0);
 
     f()
@@ -172,7 +191,6 @@ fn attempt<T>(
 mod tests {
     use super::*;
     use std::fs::File;
-    use std::os::unix::fs::MetadataExt;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
@@ -338,6 +356,46 @@ mod tests {
         let md = std::fs::metadata(&path).unwrap();
         assert_eq!(md.mode() & 0o777, 0o600);
         assert_eq!(MetadataExt::uid(&md), me);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A state path that is a hard link to another of our files (plantable by a different
+    /// uid where the kernel does not restrict hard links) passes the ownership rules but
+    /// must be bypassed: the linked file is neither written nor used as the lock.
+    #[test]
+    fn hard_linked_state_file_fails_open_and_is_not_written() {
+        let dir = private_dir("hardlink");
+        let victim = dir.join("victim-data");
+        std::fs::write(&victim, b"precious contents\n").unwrap();
+        // Hold a lock on it, the way a pidfile owner would: must not count as contention.
+        let held = File::open(&victim).unwrap();
+        // SAFETY: advisory flock on the fixture fd we just opened.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let path = dir.join("state.lock");
+        std::fs::hard_link(&victim, &path).unwrap();
+        let mut ran = false;
+        let r = attempt(&path, Duration::from_millis(60), || {
+            ran = true;
+            Ok(())
+        });
+        assert!(r.is_ok() && ran, "hard-linked state must not gate the attempt: {r:?}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious contents\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Content longer than a timestamp must not survive behind the new record: the next
+    /// attempt has to parse it and keep the gap.
+    #[test]
+    fn long_garbage_is_truncated_and_the_gap_still_applies() {
+        let dir = private_dir("tail");
+        let path = dir.join("state.lock");
+        std::fs::write(&path, "garbage that is longer than any timestamp\n").unwrap();
+        attempt(&path, MAX_WAIT, || Ok(())).unwrap();
+        let recorded = std::fs::read_to_string(&path).unwrap();
+        assert!(recorded.trim().parse::<u64>().is_ok(), "stale tail left behind: {recorded:?}");
+        let started = Instant::now();
+        attempt(&path, MAX_WAIT, || Ok(())).unwrap();
+        assert!(started.elapsed() >= MIN_GAP / 2, "gap not enforced after garbage");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
