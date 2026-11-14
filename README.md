@@ -152,6 +152,9 @@ reachable, 1 for usage errors. `-demo` is parsed but answered with "not supporte
 - Lit-pixel budget: patterns are given a target of at most `lit_budget` (5 %) lit pixels as a hint.
 - Nothing static stays on screen: the clock drifts and the unlock dialog hides itself.
 - For the strongest protection use `mode = "blank"` with `[dpms] enabled = true, quick_off = true`.
+- Without the DPMS extension (framebuffer drivers such as scfb) the monitor cannot be powered off, so
+  with `[dpms] enabled = true` the screen turns pure black after the shortest configured timeout
+  instead (at once with `quick_off`, and on `nightsaver-command -suspend`).
 
 ## Lock and PAM
 

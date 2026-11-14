@@ -219,7 +219,7 @@ impl X11 {
             return Err(X11Error::MissingExtension("RANDR"));
         }
         if !has_dpms {
-            log::warn!("X server lacks DPMS; display power management disabled");
+            log::warn!("X server lacks DPMS; the monitor cannot be powered off");
         }
 
         let screen = conn

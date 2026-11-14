@@ -53,7 +53,9 @@
 # motion_threshold_px = 10
 
 [dpms]
-# Manage monitor power saving after blanking.
+# Manage monitor power saving after blanking. On an X server without the DPMS
+# extension (scfb, Xvfb) the screen turns pure black after the shortest of these
+# timeouts instead of powering off.
 # enabled = false
 # standby = "2:00:00"
 # suspend = "2:00:00"
