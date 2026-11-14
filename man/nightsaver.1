@@ -66,9 +66,20 @@ The display system to use.
 the default, selects Wayland when
 .Ev WAYLAND_DISPLAY
 is set and X11 otherwise.
-There is no Wayland backend yet, so selecting it makes
+The Wayland backend needs a compositor with wlr-layer-shell and
+ext-idle-notify (wlroots compositors such as sway and labwc, and KWin);
+without them, as on GNOME,
 .Nm
-exit with an error.
+exits with an error.
+Locking additionally needs ext-session-lock-v1, which KWin does not have:
+there the screen is blanked but never locked.
+A lock is reported only once the compositor has confirmed it, and it is the
+compositor that keeps the session locked should
+.Nm
+die.
+Commands are sent with
+.Xr nightsaver-command 1
+over the control socket.
 .Cm x11
 in a Wayland session runs on XWayland with locking disabled: the screen is
 blanked, but
@@ -364,12 +375,9 @@ left logged in.
 .Sh AUTHORS
 .An Lucas Holt
 .Sh BUGS
-Only Xorg is supported; there is no Wayland backend yet.
-In a Wayland session
-.Nm
-refuses to start unless
-.Fl Fl backend Cm x11
-is given, and then it cannot lock.
+Wayland support is experimental: unlocking has not been tested there, keys do
+not repeat in the unlock dialog, fractional output scaling is not handled, and
+the screen cannot be locked on KWin or used at all on GNOME.
 Running xscreensaver hack programs, the xscreensaver settings dialog, fading
 (the
 .Va fade

@@ -72,6 +72,11 @@ pub fn runtime_dir() -> Option<PathBuf> {
     d.is_absolute().then_some(d)
 }
 
+/// True when a daemon for `display` answers on its control socket.
+pub fn daemon_listening(display: &str) -> bool {
+    runtime_dir().is_some_and(|d| UnixStream::connect(socket_path(&d, display)).is_ok())
+}
+
 /// Why a runtime directory must not hold our socket, or `None` when it is fine: it has to
 /// be a directory owned by `uid` that nobody else can enter.
 pub fn untrusted_runtime_dir(md: &std::fs::Metadata, uid: u32) -> Option<String> {

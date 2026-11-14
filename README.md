@@ -4,10 +4,22 @@ An OLED-friendly Xorg screensaver and PAM screen locker for MidnightBSD, written
 It is a drop-in replacement for the `xscreensaver` daemon and the `xscreensaver-command`
 control client.
 
-Status: **v0.6, Xorg only.** There is no Wayland support yet. In a Wayland session
-(`WAYLAND_DISPLAY` set) nightsaver refuses to start rather than run on XWayland, where it could
-blank the screen but not lock native Wayland clients; `--backend x11` forces it to run there with
-locking disabled.
+Status: **v0.6.** Xorg is the tested platform. Wayland support is new and experimental:
+
+| Session                                | Blank | Lock | How                                                    |
+|----------------------------------------|-------|------|--------------------------------------------------------|
+| Xorg                                   | yes   | yes  | saver windows, keyboard and pointer grab               |
+| wlroots compositors (sway, labwc)      | yes   | yes  | layer-shell surfaces, `ext-session-lock-v1`            |
+| KWin (Plasma Wayland)                  | yes   | no   | layer-shell surfaces; KWin has no `ext-session-lock-v1` |
+| GNOME Wayland                          | no    | no   | Mutter has neither layer-shell nor idle-notify; nightsaver exits with a message |
+
+In a Wayland session (`WAYLAND_DISPLAY` set) the Wayland backend is used. On Wayland a lock is only
+reported once the compositor has confirmed it, and if nightsaver dies while locked the compositor keeps
+the session locked. `--backend x11` forces XWayland, where it can blank but never locks, because X grabs
+do not reach native Wayland clients. Control goes through the socket (see Control); the real
+`xscreensaver-command` only works on Xorg. Not yet done on Wayland: fractional scaling and key repeat
+in the unlock dialog. On sway a mouse click wakes the screen only once the pointer has moved since
+blanking (sway does not give a new surface pointer focus before that); keys and motion are unaffected.
 
 ## Features
 
@@ -211,6 +223,7 @@ threat model. See the SECURITY section of `nightsaver(1)`.
 cargo test                         # unit tests: parsers, patterns, OLED guard, protocol, lock logic
 cargo clippy --all-targets -- -D warnings
 tests/xvfb_smoke.sh                # integration test on a private Xvfb (:99), never touches :0
+tests/wayland_smoke.sh             # integration test in a private headless sway
 ```
 
 `tests/xvfb_smoke.sh` needs `Xvfb`, `xrandr`, `xprop`, `xdotool` and the real `xscreensaver-command`, and uses the
@@ -219,6 +232,11 @@ stopping the real saver first.
 
 Verified on a live MidnightBSD 4.2 Xorg session: blanking, wake on activity, and locking with a
 real password accepted and a wrong one rejected through the `nightsaver` PAM policy.
+Wayland was exercised in a headless sway 1.11 with `tests/wayland_smoke.sh`: idle blanking, wake on
+pointer motion and click, commands over the socket, locking confirmed by the compositor, a pending
+lock while another locker holds the session, output hotplug, and what is on screen (screenshots).
+A headless sway has no keyboard, so **typing a password and unlocking under Wayland has not been
+tested**; neither have KWin, real hardware or output power control.
 Not yet tested: DPMS on real hardware (neither Xvfb nor the test machine's Xorg has the DPMS
 extension), multi-monitor hotplug, and the MIT-SHM path (rendering uses plain `PutImage`).
 

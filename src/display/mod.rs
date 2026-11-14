@@ -32,6 +32,10 @@ pub struct Capabilities {
     /// The monitor can really be powered down (DPMS). Without it the daemon shows a black
     /// screen instead.
     pub power_control: bool,
+    /// Exclusive input taken for blanking is not good enough to lock with: locking needs
+    /// `acquire_exclusive` with `for_lock` (Wayland: a confirmed session lock). False
+    /// where one grab serves both (X11).
+    pub lock_is_separate: bool,
 }
 
 /// What a backend reports to the daemon. Input events never carry raw key data beyond
@@ -109,10 +113,14 @@ pub trait Backend {
     /// Show `fb` on an attached surface (a no-op for one that is not attached).
     fn present(&mut self, surface: SurfaceId, fb: &Framebuffer) -> BackendResult<()>;
 
-    /// Take exclusive keyboard and pointer input, trying for up to `timeout`.
-    fn acquire_exclusive(&mut self, timeout: Duration) -> BackendResult<()>;
+    /// Take exclusive keyboard and pointer input, trying for up to `timeout`. With
+    /// `for_lock` it must be good enough to lock the screen with: `Ok` then means no other
+    /// client can receive input or show anything until `release_exclusive`.
+    fn acquire_exclusive(&mut self, timeout: Duration, for_lock: bool) -> BackendResult<()>;
     /// Confirm exclusive input is still ours without releasing anything on failure.
     fn check_exclusive(&mut self) -> BackendResult<bool>;
+    /// Give exclusive input up. This is what unlocks a locked display, so the daemon only
+    /// calls it while not locked, or after a successful authentication.
     fn release_exclusive(&mut self);
     /// False when key presses cannot be translated (`DisplayEvent::Key(None)`).
     fn has_keyboard(&self) -> bool;

@@ -498,7 +498,7 @@ impl Drop for X11Backend {
 
 impl Backend for X11Backend {
     fn capabilities(&self) -> Capabilities {
-        Capabilities { can_lock: self.lockable, power_control: self.x.has_dpms }
+        Capabilities { can_lock: self.lockable, power_control: self.x.has_dpms, lock_is_separate: false }
     }
 
     fn wait_event(
@@ -637,7 +637,7 @@ impl Backend for X11Backend {
         Ok(())
     }
 
-    fn acquire_exclusive(&mut self, timeout: Duration) -> BackendResult<()> {
+    fn acquire_exclusive(&mut self, timeout: Duration, _for_lock: bool) -> BackendResult<()> {
         match grab::grab_all(&self.x, self.x.root, timeout) {
             Ok(()) => {
                 self.grabbed = true;
