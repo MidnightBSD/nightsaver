@@ -1,6 +1,131 @@
 //! Display-independent types shared by the display backends: monitor geometry and the
 //! sanitising of monitor lists, which every backend must apply to what the display server
 //! reports before creating per-monitor surfaces and framebuffers.
+//!
+//! It also defines the seam between the daemon (all policy: the Idle -> Blanked -> Locked
+//! state machine, timers, commands, rendering) and a display backend (all mechanics: the
+//! connection, surfaces, exclusive input, monitor power, the control channel). The daemon
+//! only sees `DisplayEvent`s and calls `Backend` methods.
+
+use std::error::Error;
+use std::time::{Duration, Instant, SystemTime};
+
+use crate::compat::protocol::{Command, Status};
+use crate::config::DpmsConfig;
+use crate::input::KeyInput;
+use crate::render::Framebuffer;
+
+pub type BackendResult<T> = Result<T, Box<dyn Error>>;
+
+/// One blanking surface (an X window id on X11). Only meaningful to the backend that
+/// issued it, and only until the next `blank`/`relayout`/`unblank`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SurfaceId(pub u32);
+
+/// What the display can do; fixed for the lifetime of a backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capabilities {
+    /// False when exclusive input here would not cover every client (XWayland): nothing
+    /// may ever be reported as locked.
+    pub can_lock: bool,
+    /// The monitor can really be powered down (DPMS). Without it the daemon shows a black
+    /// screen instead.
+    pub power_control: bool,
+}
+
+/// What a backend reports to the daemon. Input events never carry raw key data beyond
+/// `KeyInput`, and must never be Debug-formatted into a log (AGENTS.md rule 3).
+pub enum DisplayEvent {
+    /// A raw event was consumed inside the backend. Reported so the daemon's per-iteration
+    /// event cap also counts events that need no policy decision.
+    Internal,
+    /// A control command; the daemon answers it with `Backend::respond`.
+    Command(Command),
+    /// A key press delivered through our exclusive input. `None` when no keyboard state is
+    /// available to translate it.
+    Key(Option<KeyInput>),
+    /// A pointer button press delivered through our exclusive input.
+    Button,
+    /// Pointer motion delivered through our exclusive input, in root coordinates.
+    Motion { x: i32, y: i32 },
+    /// A key or button press seen outside exclusive input (activity only, no content).
+    RawActivity,
+    /// The monitor layout changed.
+    OutputsChanged,
+    /// A blanking surface was moved, resized or destroyed behind our back.
+    SurfacesDisturbed,
+    /// A surface lost its contents and must be presented again.
+    Redraw(SurfaceId),
+    /// Exclusive input was (or may have been) taken away.
+    ExclusiveLost(&'static str),
+}
+
+/// The display mechanics the daemon drives. Methods that return nothing are best effort
+/// and log their own failures.
+pub trait Backend {
+    fn capabilities(&self) -> Capabilities;
+
+    /// Wait up to `timeout` for (`Some`) or poll (`None`) one event. `Err` means the event
+    /// could not be read; whether that is fatal is decided with `check_connection`.
+    fn wait_event(&mut self, timeout: Option<Duration>) -> BackendResult<Option<DisplayEvent>>;
+    /// Called once after each batch of events (deferred work such as keymap reloads).
+    fn end_of_batch(&mut self);
+    /// Round trip to the display server; `Err` when the connection is gone.
+    fn check_connection(&self) -> BackendResult<()>;
+    /// Earliest time `tick` has work to do.
+    fn next_deadline(&self) -> Option<Instant>;
+    /// Run the backend's own timers (keeping the surfaces on top).
+    fn tick(&mut self, now: Instant);
+
+    /// How long the user has been idle according to the display server. `None` when the
+    /// backend cannot be polled for it.
+    fn idle_time(&mut self) -> BackendResult<Option<Duration>>;
+    /// Pointer position in root coordinates, if known.
+    fn pointer_position(&self) -> Option<(i32, i32)>;
+
+    /// Cover every monitor with a black surface. Returns the number of monitors.
+    fn blank(&mut self) -> BackendResult<usize>;
+    /// Recreate the surfaces for the current monitor layout. On `Err` the old surfaces are
+    /// kept and stretched so nothing is left uncovered. Returns the number of monitors.
+    fn relayout(&mut self) -> BackendResult<usize>;
+    /// Put the surfaces back on screen and on top after exclusive input was lost.
+    fn restore_cover(&mut self);
+    /// Remove the surfaces (and everything attached to them).
+    fn unblank(&mut self);
+    /// The current surfaces and the monitor each one covers.
+    fn surfaces(&self) -> Vec<(SurfaceId, Monitor)>;
+    /// Prepare `surface` for `present` with frames of `width` x `height`.
+    fn attach(&mut self, surface: SurfaceId, width: u32, height: u32) -> BackendResult<()>;
+    /// Undo `attach` for one surface / for all of them.
+    fn detach(&mut self, surface: SurfaceId);
+    fn detach_all(&mut self);
+    /// Show `fb` on an attached surface (a no-op for one that is not attached).
+    fn present(&mut self, surface: SurfaceId, fb: &Framebuffer) -> BackendResult<()>;
+
+    /// Take exclusive keyboard and pointer input, trying for up to `timeout`.
+    fn acquire_exclusive(&mut self, timeout: Duration) -> BackendResult<()>;
+    /// Confirm exclusive input is still ours without releasing anything on failure.
+    fn check_exclusive(&mut self) -> BackendResult<bool>;
+    fn release_exclusive(&mut self);
+    /// False when key presses cannot be translated (`DisplayEvent::Key(None)`).
+    fn has_keyboard(&self) -> bool;
+    /// Last chance to set the keyboard up, called when the screen locks.
+    fn prepare_keyboard(&mut self);
+
+    /// Install the blanked-screen power timeouts, remembering the previous settings.
+    fn power_install(&mut self, cfg: &DpmsConfig);
+    fn power_off(&mut self);
+    fn power_on(&mut self);
+    /// Wake the monitor and put the remembered settings back.
+    fn power_restore(&mut self);
+
+    /// Advertise the saver state (`hacks`: 1-based pattern number per surface, 0 = blank).
+    fn publish_status(&mut self, status: Status, since: SystemTime, hacks: &[u32]) -> BackendResult<()>;
+    /// Answer the command being handled.
+    fn respond(&mut self, ok: bool, msg: &str);
+    /// Give the client up to `limit` to read the answer before we go away.
+    fn flush_response(&mut self, limit: Duration);
+}
 
 /// Geometry of one monitor in root-window coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

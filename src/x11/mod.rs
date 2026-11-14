@@ -1,4 +1,5 @@
 //! X11 layer built on x11rb's libxcb-backed `XCBConnection`. Owner: Opus A (keyboard.rs: Opus E).
+pub mod backend;
 pub mod conn;
 pub mod grab;
 pub mod idle;
