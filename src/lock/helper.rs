@@ -62,9 +62,11 @@ pub fn helper_path() -> PathBuf {
 /// Refuse to run a helper that is not a plain file owned by us (or root) and not writable
 /// by group or others: the helper's clean `exit(0)` is the only thing that unlocks, so a
 /// tampered or swapped helper would make the unlock dialog accept any password. A missing
-/// or symlinked path is refused by [`resolve_helper`] before this runs.
-fn trust_check(path: &std::path::Path) -> Result<(), PamError> {
-    if let Some(why) = crate::config::untrusted_file(path) {
+/// or symlinked path is refused by [`resolve_helper`] before this runs. `md` is the same
+/// stat result the `(dev, ino)` pin is taken from, so the rules and the pin describe one
+/// file.
+fn trust_check(path: &std::path::Path, md: &std::fs::Metadata) -> Result<(), PamError> {
+    if let Some(why) = crate::config::untrusted_metadata(md) {
         return Err(PamError::System(format!(
             "{HELPER_NAME}: refusing to run {}: {why}",
             path.display()
@@ -104,7 +106,7 @@ fn resolve_helper() -> Result<TrustedHelper, PamError> {
         PamError::System(format!("{HELPER_NAME} at {}: cannot stat it: {e}", path.display()))
     })?;
     check_no_symlinks(&path).map_err(PamError::System)?;
-    trust_check(&path)?;
+    trust_check(&path, &md)?;
     Ok(TrustedHelper { path, id: (md.dev(), md.ino()) })
 }
 
@@ -335,12 +337,13 @@ mod tests {
         let p = dir.join(HELPER_NAME);
         std::fs::write(&p, b"#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(trust_check(&p).is_ok(), "ours, 0600: must pass");
+        let check = |p: &std::path::Path| trust_check(p, &std::fs::metadata(p).unwrap());
+        assert!(check(&p).is_ok(), "ours, 0600: must pass");
         // Group/others writable: a swap by another local session must not be exec'd.
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o666)).unwrap();
-        assert!(trust_check(&p).is_err(), "0o666 must be refused");
-        // A missing file is not trust_check's call: resolve_helper stats first and refuses.
-        assert!(trust_check(&dir.join("missing")).is_ok());
+        assert!(check(&p).is_err(), "0o666 must be refused");
+        // Not a plain file: refused as well.
+        assert!(check(&dir).is_err(), "a directory must be refused");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
