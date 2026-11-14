@@ -44,7 +44,8 @@ use crate::render::oled::OledGuard;
 use crate::x11::conn::X11;
 use crate::x11::present::Presenter;
 use crate::x11::saver_window::{self, SaverWindows};
-use crate::x11::{Monitor, X11Error, grab, idle, monitors};
+use crate::display::Monitor;
+use crate::x11::{X11Error, grab, idle, monitors};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaverState {
@@ -93,7 +94,8 @@ mod lockapi {
     use crate::render::Framebuffer;
     use crate::x11::X11Error;
     use crate::x11::conn::X11;
-    use crate::x11::keyboard::{KeyInput, Keyboard};
+    use crate::input::KeyInput;
+    use crate::x11::keyboard::Keyboard;
 
     pub fn new_locker(user: String, service: String, passwd_timeout: Duration) -> Locker {
         Locker::new(user, service, passwd_timeout)
@@ -147,7 +149,8 @@ mod lockapi {
 }
 
 use crate::lock::{LockEvent, Locker};
-use crate::x11::keyboard::{KeyInput, Keyboard};
+use crate::input::KeyInput;
+use crate::x11::keyboard::Keyboard;
 
 // ---------------------------------------------------------------------------
 // Signals

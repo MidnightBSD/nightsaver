@@ -8,6 +8,8 @@ pub mod cli;
 pub mod compat;
 pub mod config;
 pub mod daemon;
+pub mod display;
+pub mod input;
 pub mod lock;
 pub mod logging;
 pub mod patterns;

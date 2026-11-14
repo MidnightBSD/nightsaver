@@ -28,7 +28,8 @@ use x11rb::protocol::xproto::{
 use x11rb::wrapper::ConnectionExt as _;
 
 use super::conn::X11;
-use super::{Monitor, X11Error};
+use super::X11Error;
+use crate::display::Monitor;
 
 const NAME: &str = "nightsaver";
 
