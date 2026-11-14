@@ -3,11 +3,13 @@
 #
 # Starts a private headless sway (its own XDG_RUNTIME_DIR, no real outputs or input
 # devices), runs target/debug/nightsaver in it with a throw-away HOME, and drives it with
-# nightsaver-command over the control socket. Input comes from a virtual pointer, and
-# another locker is played by the wl_lock helper. Never touches the user's session.
+# nightsaver-command over the control socket. Input comes from a virtual pointer and a
+# virtual keyboard, and another locker is played by the wl_lock helper. Never touches the
+# user's session.
 #
-# A headless sway has no keyboard, so typing a password (and therefore unlocking) is not
-# covered here.
+# The daemon runs from a private copy with a stand-in nightsaver-auth beside it that accepts
+# one fixed test password, so the unlock path is exercised without the system PAM policy
+# or a real password. PAM itself is not covered here.
 #
 # Usage: cargo build --bins --examples && tests/wayland_smoke.sh
 # Needs: sway, ImageMagick's convert.
@@ -17,16 +19,20 @@ set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${NS_BIN:-$ROOT/target/debug}"
-DAEMON="$BIN/nightsaver"
+DAEMON_SRC="$BIN/nightsaver"
 CMD="$BIN/nightsaver-command"
 SHOT="$BIN/examples/wl_shot"
 POINTER="$BIN/examples/wl_pointer"
 LOCKER="$BIN/examples/wl_lock"
+KEYS="$BIN/examples/wl_keys"
+# Not a real password: only the stand-in helper below knows it.
+TEST_PASSWORD='Smoke-pass1'
 
 SWAY_PID=""
 DAEMON_PID=""
 POINTER_PID=""
 LOCKER_PID=""
+KEYS_PID=""
 # Short on purpose: the Wayland and control sockets live here and a Unix socket path is
 # limited to about 100 bytes.
 TMP="$(mktemp -d /tmp/ns-wl.XXXXXX)"
@@ -34,7 +40,8 @@ FAILS=0
 
 cleanup() {
     exec 9>&- 2>/dev/null
-    for p in "$LOCKER_PID" "$POINTER_PID"; do
+    exec 8>&- 2>/dev/null
+    for p in "$LOCKER_PID" "$POINTER_PID" "$KEYS_PID"; do
         [ -n "$p" ] && kill "$p" 2>/dev/null
     done
     # Stopping the compositor ends a locked daemon cleanly (its connection is gone); the
@@ -74,13 +81,14 @@ is_blanked() { status_time | grep -q "screen blanked since"; }
 is_unblanked() { status_time | grep -q "screen non-blanked since"; }
 is_locked() { status_time | grep -q "screen locked since"; }
 ptr() { echo "$*" >&9; sleep 0.3; }
+keys() { echo "$*" >&8; sleep 0.3; }
 # Mean brightness of the screen, in millionths (0 = pure black).
 screen_mean() {
     "$SHOT" "$TMP/shot.ppm" >/dev/null 2>&1 || { echo -1; return; }
     convert "$TMP/shot.ppm" -format "%[fx:int(mean*1e6)]" info: 2>/dev/null || echo -1
 }
 
-for tool in sway convert "$DAEMON" "$CMD" "$SHOT" "$POINTER" "$LOCKER"; do
+for tool in sway convert "$DAEMON_SRC" "$CMD" "$SHOT" "$POINTER" "$LOCKER" "$KEYS"; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "FAIL: missing $tool (run: cargo build --bins --examples)"; exit 1
     fi
@@ -91,6 +99,20 @@ mkdir -m 700 "$XDG_RUNTIME_DIR"
 export HOME="$TMP/home"
 mkdir -p "$HOME/.config/nightsaver"
 unset DISPLAY XAUTHORITY WAYLAND_DISPLAY SWAYSOCK
+
+# The daemon prefers a nightsaver-auth next to its own executable, so a private copy gets
+# the stand-in: exit 0 for the test password, 1 (denied) for anything else.
+mkdir "$TMP/bin"
+cp "$DAEMON_SRC" "$TMP/bin/nightsaver"
+DAEMON="$TMP/bin/nightsaver"
+cat >"$TMP/bin/nightsaver-auth" <<EOF
+#!/bin/sh
+pw="\$(tr '\\000' '\\n' | sed -n 3p)"
+[ "\$pw" = '$TEST_PASSWORD' ] && exit 0
+echo "stand-in helper: wrong password"
+exit 1
+EOF
+chmod 755 "$TMP/bin/nightsaver-auth"
 
 write_config() {
     cat >"$HOME/.config/nightsaver/config.toml" <<EOF
@@ -113,6 +135,11 @@ mkfifo "$TMP/ptr.fifo"
 POINTER_PID=$!
 exec 9>"$TMP/ptr.fifo"
 wait_for 3 "grep -q ready $TMP/ptr.out" || { echo "FAIL: no virtual pointer"; cat "$TMP/ptr.out"; exit 1; }
+mkfifo "$TMP/keys.fifo"
+"$KEYS" <"$TMP/keys.fifo" >"$TMP/keys.out" 2>&1 &
+KEYS_PID=$!
+exec 8>"$TMP/keys.fifo"
+wait_for 3 "grep -q ready $TMP/keys.out" || { echo "FAIL: no virtual keyboard"; cat "$TMP/keys.out"; exit 1; }
 
 write_config 0:00:03
 "$DAEMON" --verbose >"$TMP/daemon.log" 2>&1 &
@@ -257,23 +284,59 @@ if wait_for 3 "[ \"\$(grep -c 'monitor layout changed' '$TMP/daemon.log')\" -gt 
 else
     fail "(d) output hotplug: $(status_time)"
 fi
-if grep -Eqi "key *(press|input|sym)" "$TMP/daemon.log"; then
-    fail "(d) key data in the log"
+
+# (e) the keyboard: a wrong password is denied, the right one unlocks --------------------------
+ptr move 20 20
+keys type not-the-password
+keys key enter
+if wait_for 10 "grep -Eqi 'authentication failed|denied' '$TMP/daemon.log'" && is_locked; then
+    pass "(e) a typed wrong password reaches the helper, is denied, and the lock is kept"
 else
-    pass "(d) no key events in the log"
+    fail "(e) wrong password: $(status_time); $(tail -3 "$TMP/daemon.log")"
+fi
+# Typed, corrected with backspace, then submitted: Shift, digits and punctuation included.
+# Retried because a failed attempt is followed by a delay.
+unlocked=0
+for _ in 1 2 3 4 5 6; do
+    sleep 2
+    ptr move 20 20
+    keys type "${TEST_PASSWORD}x"
+    keys key backspace
+    keys key enter
+    if wait_for 3 is_unblanked; then unlocked=1; break; fi
+done
+if [ "$unlocked" -eq 1 ] && grep -q "unblanked (Unlocked)" "$TMP/daemon.log"; then
+    pass "(e) the right password unlocks: $(status_time)"
+else
+    fail "(e) right password did not unlock: $(status_time); $(tail -5 "$TMP/daemon.log")"
+fi
+if "$LOCKER" 1 >"$TMP/lock2.out" 2>&1 && grep -q locked "$TMP/lock2.out"; then
+    pass "(e) the compositor released the session (another client can lock it again)"
+else
+    fail "(e) the session lock was not released: $(cat "$TMP/lock2.out")"
+fi
+if grep -Eqi "key *(press|input|sym)|$TEST_PASSWORD|not-the-password" "$TMP/daemon.log"; then
+    fail "(e) key data or a password in the log"
+else
+    pass "(e) no key events or passwords in the log"
+fi
+if ctl -lock >/dev/null 2>&1 && wait_for 5 is_locked; then
+    pass "(e) locks again after an unlock"
+else
+    fail "(e) second lock: $(status_time)"
 fi
 
-# (e) the compositor goes away: the daemon ends, the lock was never released -----------------
+# (f) the compositor goes away: the daemon ends, the lock was never released -----------------
 kill "$SWAY_PID"; wait "$SWAY_PID" 2>/dev/null; SWAY_PID=""
 gone=0
 for _ in $(seq 1 50); do
     if ! kill -0 "$DAEMON_PID" 2>/dev/null; then gone=1; break; fi
     sleep 0.1
 done
-if [ "$gone" -eq 1 ] && ! grep -q "unblanked" <(sed -n '/locked (pattern/,$p' "$TMP/daemon.log"); then
-    pass "(e) daemon exited with the compositor, without unlocking first"
+if [ "$gone" -eq 1 ] && ! grep -q "unblanked" <(awk '/locked \(pattern/ { buf = "" } { buf = buf $0 "\n" } END { printf "%s", buf }' "$TMP/daemon.log"); then
+    pass "(f) daemon exited with the compositor, without unlocking first"
 else
-    fail "(e) gone=$gone; log tail: $(tail -3 "$TMP/daemon.log")"
+    fail "(f) gone=$gone; log tail: $(tail -3 "$TMP/daemon.log")"
 fi
 DAEMON_PID=""
 

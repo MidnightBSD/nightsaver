@@ -234,9 +234,11 @@ Verified on a live MidnightBSD 4.2 Xorg session: blanking, wake on activity, and
 real password accepted and a wrong one rejected through the `nightsaver` PAM policy.
 Wayland was exercised in a headless sway 1.11 with `tests/wayland_smoke.sh`: idle blanking, wake on
 pointer motion and click, commands over the socket, locking confirmed by the compositor, a pending
-lock while another locker holds the session, output hotplug, and what is on screen (screenshots).
-A headless sway has no keyboard, so **typing a password and unlocking under Wayland has not been
-tested**; neither have KWin, real hardware or output power control.
+lock while another locker holds the session, output hotplug, what is on screen (screenshots), and
+typing on a virtual keyboard: a wrong password is denied and the right one unlocks. That test uses a
+stand-in for `nightsaver-auth` with a fixed test password, so **PAM and a real keyboard have not been
+tested under Wayland**; neither have KWin or real hardware. Output power control was checked by hand
+in the headless sway.
 Not yet tested: DPMS on real hardware (neither Xvfb nor the test machine's Xorg has the DPMS
 extension), multi-monitor hotplug, and the MIT-SHM path (rendering uses plain `PutImage`).
 

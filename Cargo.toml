@@ -44,3 +44,7 @@ log = { version = "0.4", features = ["std"] }
 lto = true
 codegen-units = 1
 strip = true
+
+[dev-dependencies]
+# Test helper only (examples/wl_keys.rs): the virtual-keyboard protocol.
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
