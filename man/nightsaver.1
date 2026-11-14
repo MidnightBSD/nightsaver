@@ -242,6 +242,24 @@ See
 xscreensaver resource file; a subset of keys is read.
 .It Pa /usr/local/etc/nightsaver.toml.sample
 Annotated sample configuration.
+.It Pa $XDG_RUNTIME_DIR/nightsaver- Ns Ar display Ns Pa .sock
+Control socket used by
+.Xr nightsaver-command 1
+with
+.Fl socket .
+It carries the same commands as the xscreensaver protocol and applies the
+same rules, so
+.Cm exit ,
+.Cm restart
+and
+.Cm suspend
+are refused while the screen is locked.
+It is created only when
+.Ev XDG_RUNTIME_DIR
+is set to a directory that belongs to the user and is closed to everyone
+else; the socket has mode 0600 and connections from other users are
+dropped.
+Without such a directory the daemon runs without the socket.
 .It Pa /usr/local/etc/pam.d/xscreensaver
 PAM service used by default.
 .It Pa /usr/local/etc/pam.d/nightsaver

@@ -4,6 +4,11 @@
 //! `driver/xscreensaver-command.c` and `driver/remote.c`; see
 //! `nightsaver::compat::protocol` for the wire format. Self-contained: talks to
 //! the server with x11rb's pure-Rust connection, not `nightsaver::x11`.
+//!
+//! A nightsaver daemon also listens on a Unix socket (`nightsaver::control`), which is the
+//! only way to reach it where there is no X server. The socket is used with `-socket`, or
+//! by itself in a Wayland session when the daemon's socket exists; messages and exit
+//! statuses are the same as over X.
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -11,6 +16,7 @@ use std::process::exit;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{ArgGroup, Parser};
+use nightsaver::control::{self, Request};
 use nightsaver::compat::protocol::{
     self, ATOM_STATUS, AtomTable, Command, ProtocolAtoms, ProtocolError, RawStatus, Response,
     TimeLine, WatchState,
@@ -39,6 +45,9 @@ const EXIT_FAIL: i32 = 255;
 struct Cli {
     #[arg(long)]
     display: Option<String>,
+    /// Talk to the daemon's control socket instead of the X server.
+    #[arg(long)]
+    socket: bool,
     /// 0 = -quiet, 1 = -verbose (default), 2..4 = -vv..-vvvv.
     #[arg(long, default_value_t = 1)]
     verbosity: u8,
@@ -149,6 +158,11 @@ fn normalise(prog: &str, args: &[String]) -> (Vec<OsString>, String) {
                 _ => None,
             }
         };
+        if s == "-socket" {
+            out.push("--socket".into());
+            i += 1;
+            continue;
+        }
         if let Some(v) = verbosity {
             out.push(format!("--verbosity={v}").into());
             i += 1;
@@ -193,6 +207,8 @@ usage: {prog} -<option>\n\
   Options may be abbreviated and given with one or two dashes.\n\
 \n\
   -display <dpy> X display to talk to (default: $DISPLAY).\n\
+  -socket        Use the daemon's control socket instead of the X server\n\
+                 (the default in a Wayland session when the socket exists).\n\
   -quiet         Only print output if an error occurs.\n\
   -verbose       Opposite of -quiet. Default.\n\
 \n\
@@ -321,6 +337,26 @@ fn main() {
         usage_error(&prog, "no commands", "");
     };
 
+    let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    if let Some((path, name)) = socket_target(cli.socket, cli.display.as_deref(), env("WAYLAND_DISPLAY"), env("DISPLAY")) {
+        let Some(path) = path else {
+            fail(&prog, "-socket: XDG_RUNTIME_DIR is not set");
+        };
+        let ctx = SocketCtx { prog: &prog, name: &name, path: &path, verbosity: cli.verbosity };
+        let rc = match action {
+            Action::Watch => ctx.watch(),
+            Action::Version => ctx.version_or_time(false),
+            Action::Time => ctx.version_or_time(true),
+            Action::Send(c) => ctx.command(c),
+            Action::Demo(_) => ctx.command(Command::Demo),
+        };
+        flush_all();
+        exit(match rc {
+            Ok(code) => code,
+            Err(e) => fail(&prog, e),
+        });
+    }
+
     let dpyname = match cli.display.or_else(|| std::env::var("DISPLAY").ok()) {
         Some(d) => d,
         None => {
@@ -359,6 +395,193 @@ fn main() {
         Ok(code) => code,
         Err(e) => fail(&prog, e),
     });
+}
+
+/// Decide whether to use the control socket, and for which display. Returns the socket
+/// path (`None` inside when there is no runtime directory) and the display name for
+/// messages; `None` means "use the X protocol".
+///
+/// With `-socket` the socket is always used: for `-display` if given, else the Wayland
+/// display, else `$DISPLAY`. Without it the socket is only used in a Wayland session, when
+/// no `-display` was given and that session's daemon socket exists; otherwise a daemon
+/// running on XWayland is still reached over X.
+fn socket_target(
+    forced: bool,
+    display: Option<&str>,
+    wayland: Option<String>,
+    x: Option<String>,
+) -> Option<(Option<std::path::PathBuf>, String)> {
+    let dir = control::runtime_dir();
+    if forced {
+        let name = display.map(str::to_owned).or(wayland).or(x).unwrap_or_else(|| ":0".into());
+        let path = dir.map(|d| control::socket_path(&d, &name));
+        return Some((path, name));
+    }
+    if display.is_some() {
+        return None;
+    }
+    let name = wayland?;
+    let path = control::socket_path(&dir?, &name);
+    std::fs::symlink_metadata(&path).is_ok().then_some((Some(path), name))
+}
+
+/// The same commands as [`Ctx`], over the control socket.
+struct SocketCtx<'a> {
+    prog: &'a str,
+    name: &'a str,
+    path: &'a std::path::Path,
+    verbosity: u8,
+}
+
+impl SocketCtx<'_> {
+    /// One request, one reply line. `Ok(None)` when no daemon is listening.
+    fn ask(&self, req: Request) -> Result<Option<Option<String>>, String> {
+        use std::io::ErrorKind;
+        let io = |e: std::io::Error| format!("control socket: {e}");
+        let mut conn = match control::send(self.path, req) {
+            Ok(c) => c,
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => {
+                return Ok(None);
+            }
+            Err(e) => return Err(io(e)),
+        };
+        // Like the X client, do not wait for an answer for ever.
+        let _ = conn.get_ref().set_read_timeout(Some(Duration::from_secs(10)));
+        match control::read_line(&mut conn) {
+            Ok(line) => Ok(Some(line)),
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                fail(self.prog, "no response to command.")
+            }
+            Err(e) => Err(io(e)),
+        }
+    }
+
+    fn no_daemon(&self) -> ! {
+        fail(self.prog, format_args!("no screensaver is running on display {}", self.name));
+    }
+
+    /// The reply to a query, which is always `+text`.
+    fn query(&self, req: Request) -> Result<String, String> {
+        let Some(line) = self.ask(req)? else {
+            self.no_daemon();
+        };
+        match line.as_deref().and_then(control::parse_reply) {
+            Some((true, text)) => Ok(text.to_owned()),
+            Some((false, text)) => fail(self.prog, printable(text)),
+            None => fail(self.prog, "no response to command."),
+        }
+    }
+
+    fn version_or_time(&self, time: bool) -> Result<i32, String> {
+        print!("{}", printable(&self.query(Request::Version)?));
+        if !time {
+            println!();
+            return Ok(0);
+        }
+        let status = self.query(Request::Status)?;
+        let line = control::parse_status_line(&status)
+            .map(|items| protocol::format_time_line(&items, &control::status_atoms(), ctime));
+        match line {
+            Some(TimeLine::Ok(s)) => {
+                print!("{s}");
+                Ok(0)
+            }
+            _ => {
+                println!();
+                flush_all();
+                eprintln!("bad status format from the daemon");
+                Ok(EXIT_FAIL)
+            }
+        }
+    }
+
+    fn command(&self, cmd: Command) -> Result<i32, String> {
+        let prog = self.prog;
+        let Some(line) = self.ask(Request::Command(cmd))? else {
+            if cmd == Command::Exit {
+                // Don't print an error if the daemon is already gone.
+                return Ok(0);
+            }
+            self.no_daemon();
+        };
+        match line.as_deref().map(control::parse_reply) {
+            Some(Some((true, text))) => {
+                if self.verbosity > 0 {
+                    println!("{prog}: {}\n", printable(text));
+                }
+            }
+            Some(Some((false, text))) => {
+                flush_all();
+                eprintln!("{prog}: {}\n", printable(text));
+                return Ok(EXIT_FAIL);
+            }
+            Some(None) => fail(prog, "unrecognized response message."),
+            None => {
+                // The daemon went away before answering EXIT: that is success, as over X.
+                // One that is still listening dropped the request instead.
+                if cmd == Command::Exit && self.ask(Request::Version)?.is_none() {
+                    return Ok(0);
+                }
+                fail(prog, "no response to command.");
+            }
+        }
+        if cmd.waits_for_blank() {
+            return self.wait_for_blank();
+        }
+        Ok(0)
+    }
+
+    fn wait_for_blank(&self) -> Result<i32, String> {
+        let prog = self.prog;
+        let mut verbosity = self.verbosity;
+        let start = now_secs();
+        loop {
+            let status = self.query(Request::Status)?;
+            if verbosity > 1 {
+                eprintln!("{prog}: read status: {}", printable(&status));
+            }
+            if control::parse_status_line(&status).is_some_and(|items| items[0] != 0) {
+                if verbosity > 1 {
+                    eprintln!("{prog}: screen blanked");
+                }
+                return Ok(0);
+            }
+            let now = now_secs();
+            if now >= start + 10 {
+                fail(prog, "Timed out waiting for screen to blank");
+            } else if verbosity == 1 && now > start + 3 {
+                eprintln!("{prog}: waiting for status change");
+                verbosity += 1;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// `-watch`. Only returns on error.
+    fn watch(&self) -> Result<i32, String> {
+        let io = |e: std::io::Error| format!("control socket: {e}");
+        let mut conn = match control::send(self.path, Request::Watch) {
+            Ok(c) => c,
+            Err(_) => self.no_daemon(),
+        };
+        let atoms = control::status_atoms();
+        let mut state = WatchState::new();
+        loop {
+            let Some(line) = control::read_line(&mut conn).map_err(io)? else {
+                fail(self.prog, "the daemon closed the connection");
+            };
+            let lines = control::parse_status_line(&line)
+                .and_then(|items| state.update(&items, &atoms, ctime));
+            let Some(lines) = lines else {
+                fail(self.prog, "bad status format from the daemon");
+            };
+            let mut out = std::io::stdout().lock();
+            for l in lines {
+                let _ = writeln!(out, "{l}");
+            }
+            let _ = out.flush();
+        }
+    }
 }
 
 struct Ctx<'a, C: Connection> {

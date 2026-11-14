@@ -12,6 +12,7 @@
 //! changes it.
 
 use std::error::Error;
+use std::os::fd::RawFd;
 use std::time::{Duration, Instant, SystemTime};
 
 use x11rb::connection::Connection;
@@ -500,9 +501,13 @@ impl Backend for X11Backend {
         Capabilities { can_lock: self.lockable, power_control: self.x.has_dpms }
     }
 
-    fn wait_event(&mut self, timeout: Option<Duration>) -> BackendResult<Option<DisplayEvent>> {
+    fn wait_event(
+        &mut self,
+        timeout: Option<Duration>,
+        wake: &[RawFd],
+    ) -> BackendResult<Option<DisplayEvent>> {
         let r = match timeout {
-            Some(t) => self.x.wait_event_timeout(t),
+            Some(t) => self.x.wait_event_timeout_or(t, wake),
             None => self.x.poll_event(),
         };
         match r {

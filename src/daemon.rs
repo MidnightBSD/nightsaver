@@ -31,6 +31,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::cli::Args;
 use crate::compat::protocol::{Command, Status};
+use crate::control::{self, ControlServer, Request};
 use crate::config::{Config, Mode, ResolvedBackend, resolve_backend, wayland_session};
 use crate::patterns::{self, Pattern, Rng};
 use crate::render::Framebuffer;
@@ -252,6 +253,11 @@ struct Daemon {
     /// False when the display cannot be locked (`Capabilities::can_lock`; XWayland): grabs
     /// there do not cover native Wayland clients, so nothing may ever be reported as locked.
     lockable: bool,
+    /// The control socket; `None` when it could not be set up (no runtime directory).
+    control: Option<ControlServer>,
+    /// The socket client whose command is being handled; its reply goes there instead of
+    /// to the backend's control channel.
+    reply_to: Option<control::Client>,
 }
 
 /// Refusal when the Wayland backend is selected: there is none yet, and silently falling
@@ -294,6 +300,16 @@ pub fn run(args: Args, cfg: Config) -> Result<(), Box<dyn Error>> {
         lockable,
     )?);
     let caps = backend.capabilities();
+    let control = match ControlServer::bind(&display_name) {
+        Ok(c) => {
+            log::info!("control socket: {}", c.path().display());
+            Some(c)
+        }
+        Err(e) => {
+            log::info!("no control socket ({e})");
+            None
+        }
+    };
 
     log::info!(
         "{PROGNAME} {} (xscreensaver {} compatible) on display {display_name}: timeout {}s, \
@@ -350,6 +366,8 @@ pub fn run(args: Args, cfg: Config) -> Result<(), Box<dyn Error>> {
         soft_off: false,
         soft_off_deadline: None,
         lockable: caps.can_lock,
+        control,
+        reply_to: None,
     };
 
     match d.event_loop()? {
@@ -433,6 +451,11 @@ impl Daemon {
             ev = self.next_event(None)?;
         }
         self.backend.end_of_batch();
+        match self.serve_control() {
+            Ok(Some(exit)) => return Ok(Some(exit)),
+            Ok(None) => {}
+            Err(e) => self.recoverable(e)?,
+        }
         match self.handle_signals() {
             Ok(Some(exit)) => return Ok(Some(exit)),
             Ok(None) => {}
@@ -448,7 +471,8 @@ impl Daemon {
     /// example an unparsable event) is fatal only when the connection is really gone;
     /// otherwise the bad event is dropped and the loop continues.
     fn next_event(&mut self, timeout: Option<Duration>) -> Result<Option<DisplayEvent>, Box<dyn Error>> {
-        match self.backend.wait_event(timeout) {
+        let wake = self.control.as_ref().map(ControlServer::fds).unwrap_or_default();
+        match self.backend.wait_event(timeout, &wake) {
             Ok(ev) => Ok(ev),
             Err(e) => {
                 self.recoverable(e)?;
@@ -735,8 +759,57 @@ impl Daemon {
     // -----------------------------------------------------------------------
     // Commands
     // -----------------------------------------------------------------------
+    /// Answer the command being handled, on the channel it arrived on.
     fn respond(&mut self, ok: bool, msg: &str) {
-        self.backend.respond(ok, msg);
+        match self.reply_to.take() {
+            Some(client) => client.reply(ok, msg),
+            None => self.backend.respond(ok, msg),
+        }
+    }
+
+    /// Handle what arrived on the control socket. Commands take the same path as those
+    /// from the display's own control channel, so every refusal rule applies unchanged.
+    fn serve_control(&mut self) -> Result<Option<Exit>, Box<dyn Error>> {
+        let Some(server) = self.control.as_mut() else {
+            return Ok(None);
+        };
+        let mut first_err = None;
+        for (request, client) in server.poll(Instant::now()) {
+            match request {
+                Request::Command(cmd) => {
+                    self.reply_to = Some(client);
+                    let r = self.command(cmd);
+                    if let Some(unanswered) = self.reply_to.take() {
+                        unanswered.reply(false, "command failed");
+                    }
+                    match r {
+                        Ok(Some(exit)) => return Ok(Some(exit)),
+                        Ok(None) => {}
+                        // Keep serving the other clients; report the first failure.
+                        Err(e) => {
+                            if let Some(earlier) = first_err.replace(e) {
+                                first_err = Some(earlier);
+                            }
+                        }
+                    }
+                }
+                Request::Version => client.reply(
+                    true,
+                    &format!("{} {}", control::DAEMON_CLASS, crate::COMPAT_XSCREENSAVER_VERSION),
+                ),
+                Request::Status => {
+                    if let Some(server) = self.control.as_ref() {
+                        client.reply(true, server.status_line());
+                    }
+                }
+                Request::Watch => {
+                    if let Some(server) = self.control.as_mut() {
+                        server.watch(client);
+                    }
+                }
+            }
+        }
+        first_err.map_or(Ok(None), Err)
     }
 
     /// Locking needs a user name for PAM. A missing keyboard does not disable locking (L6):
@@ -884,8 +957,11 @@ impl Daemon {
                     self.respond(false, "screen is locked");
                 } else {
                     let restart = cmd == Command::Restart;
+                    let via_backend = self.reply_to.is_none();
                     self.respond(true, if restart { "restarting" } else { "exiting" });
-                    self.backend.flush_response(Duration::from_secs(1));
+                    if via_backend {
+                        self.backend.flush_response(Duration::from_secs(1));
+                    }
                     self.deactivate(Why::Exit);
                     return Ok(Some(if restart { Exit::Restart } else { Exit::Quit }));
                 }
@@ -1303,6 +1379,9 @@ impl Daemon {
         } else {
             SystemTime::now()
         };
+        if let Some(server) = self.control.as_mut() {
+            server.set_status(want, since, &hacks);
+        }
         match self.backend.publish_status(want, since, &hacks) {
             Ok(()) => {
                 self.status_since = since;
