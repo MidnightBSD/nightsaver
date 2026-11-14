@@ -132,6 +132,12 @@ nightsaver-command -activate | -deactivate | -cycle | -next | -prev | -select N
 Same meaning as `xscreensaver-command`. Exit status 0 on success, 255 if the daemon refused or is not
 reachable, 1 for usage errors. `-demo` is parsed but answered with "not supported".
 
+The daemon also listens on a Unix socket, `$XDG_RUNTIME_DIR/nightsaver-<display>.sock`, which carries
+the same commands and replies without the X protocol: `nightsaver-command -socket -lock`. It is created
+only when `XDG_RUNTIME_DIR` is a directory owned by you and closed to everyone else; the socket is mode
+0600, connections from other users are dropped, and the lock rules (no `-exit`, `-restart` or
+`-suspend` while locked) are the same as over X. The real `xscreensaver-command` only speaks X.
+
 ## Patterns
 
 | Name        | Description                                                  |

@@ -7,10 +7,12 @@
 .Sh SYNOPSIS
 .Nm
 .Op Fl display Ar host:display.screen
+.Op Fl socket
 .Op Fl quiet | Fl verbose
 .Fl activate | deactivate | cycle | next | prev | lock | suspend | exit | restart | time | watch | version
 .Nm
 .Op Fl display Ar host:display.screen
+.Op Fl socket
 .Op Fl quiet | Fl verbose
 .Fl select Ar N
 .Sh DESCRIPTION
@@ -31,11 +33,33 @@ The daemon is found through the
 property on the root window of the display, and the reply is read back through
 .Dq _SCREENSAVER_RESPONSE .
 .Pp
+A
+.Xr nightsaver 1
+daemon also listens on a Unix socket in
+.Ev XDG_RUNTIME_DIR ,
+which carries the same commands and replies without an X server.
+It is used when
+.Fl socket
+is given, and by default in a Wayland session
+.Pq Ev WAYLAND_DISPLAY No is set
+when no
+.Fl display
+is given and the daemon's socket exists.
+An xscreensaver daemon has no such socket.
+.Pp
 The options are:
 .Bl -tag -width indent
 .It Fl display Ar dpy
 The X display to talk to.
 The default is
+.Ev DISPLAY .
+.It Fl socket
+Talk to the daemon over its control socket instead of the X server.
+The daemon is the one for
+.Fl display
+if given, otherwise for
+.Ev WAYLAND_DISPLAY ,
+otherwise for
 .Ev DISPLAY .
 .It Fl quiet
 Print output only if an error occurs.
@@ -105,6 +129,11 @@ is parsed but the daemon answers that it is not supported.
 .Bl -tag -width DISPLAY
 .It Ev DISPLAY
 The default display.
+.It Ev WAYLAND_DISPLAY
+When set, the control socket is preferred; see above.
+.It Ev XDG_RUNTIME_DIR
+The directory holding the control socket,
+.Pa nightsaver- Ns Ar display Ns Pa .sock .
 .El
 .Sh EXIT STATUS
 .Bl -tag -width indent

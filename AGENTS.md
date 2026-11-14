@@ -23,6 +23,7 @@ src/bin/nightsaver-auth.rs     PAM helper process (one per unlock attempt; see s
 src/cli.rs                     xscreensaver-compatible flag parsing
 src/config/                    merged Config: CLI > ~/.config/nightsaver/config.toml > ~/.xscreensaver > defaults
 src/compat/protocol.rs         SCREENSAVER ClientMessage + _SCREENSAVER_* root/window properties
+src/control.rs                 control socket ($XDG_RUNTIME_DIR/nightsaver-<display>.sock): wire format, server, client helpers
 src/display/ src/input.rs      display-independent contract: trait Backend + DisplayEvent, Monitor + sanitize, KeyInput + classify
 src/x11/                       backend.rs (impl Backend) over x11rb XCBConnection, monitors, saver windows, idle, grabs, present, keyboard
 src/render/                    Framebuffer (0x00RRGGBB), bitmap font, OLED post-pass
@@ -39,7 +40,7 @@ etc/ man/ tests/ Makefile      packaging, man pages, Xvfb smoke test
 2. **Stay inside the files you own.** Shared contracts live in the module `mod.rs` files and
    `src/config/mod.rs`, `src/patterns/mod.rs`, `src/render/mod.rs`, `src/compat/protocol.rs`,
    `src/lock/mod.rs`, `src/lock/pam.rs`, `src/x11/mod.rs`, `src/x11/keyboard.rs`,
-   `src/display/mod.rs`, `src/input.rs`. Changing a
+   `src/display/mod.rs`, `src/input.rs`, `src/control.rs`. Changing a
    shared contract requires updating every user in the same change and saying so in your report.
 3. **Lock-screen security invariants** (non-negotiable):
    - Never unmap, lower, or exit while `SaverState::Locked` except after a successful PAM result.
@@ -51,7 +52,9 @@ etc/ man/ tests/ Makefile      packaging, man pages, Xvfb smoke test
    - `EXIT`/`RESTART`/`DEACTIVATE` commands and SIGTERM are ignored while locked **or while a lock
      is pending** (grab not yet acquired); a pending lock shows a visible "NOT LOCKED" notice.
    - Fail closed: an unknown user name, a PAM failure of any kind, or a hung authenticator all
-     mean "denied", never "unlocked". Synthetic (`XSendEvent`) events other than ClientMessage
+     mean "denied", never "unlocked". Commands from the control socket go through
+     `Daemon::command` like X ones (no second code path past the lock rules), and the socket
+     only accepts peers with our uid. Synthetic (`XSendEvent`) events other than ClientMessage
      are dropped. Config and log files are checked for ownership and mode before use.
 4. **xscreensaver compatibility is defined by behaviour**, verified with the real
    `/usr/local/bin/xscreensaver-command` and `xprop -root`. When in doubt read the xscreensaver

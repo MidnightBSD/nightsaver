@@ -279,6 +279,16 @@ impl X11 {
 
     /// Wait up to `timeout` for an event. Returns `Ok(None)` on timeout.
     pub fn wait_event_timeout(&self, timeout: Duration) -> Result<Option<Event>, X11Error> {
+        self.wait_event_timeout_or(timeout, &[])
+    }
+
+    /// Like `wait_event_timeout`, but also returns `Ok(None)` as soon as one of the `wake`
+    /// descriptors is readable (or in error; its owner finds out when it reads).
+    pub fn wait_event_timeout_or(
+        &self,
+        timeout: Duration,
+        wake: &[std::os::fd::RawFd],
+    ) -> Result<Option<Event>, X11Error> {
         let deadline = Instant::now() + timeout;
         loop {
             // An event may already be buffered inside libxcb; check before touching the fd.
@@ -295,14 +305,14 @@ impl X11 {
                 .as_millis()
                 .saturating_add(1)
                 .min(i32::MAX as u128) as i32;
-            let mut pfd = libc::pollfd {
-                fd: self.conn.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: `pfd` is a valid, initialised pollfd that lives for the whole call and we
-            // pass nfds = 1 matching the single element; the fd is owned by `self.conn`.
-            let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+            let mut pfds: Vec<libc::pollfd> = std::iter::once(self.conn.as_raw_fd())
+                .chain(wake.iter().copied())
+                .map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
+                .collect();
+            // SAFETY: `pfds` is a valid, initialised slice of pollfd that lives for the whole
+            // call and nfds is its length; the first fd is owned by `self.conn`, the others
+            // by the caller for the duration of this call.
+            let rc = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, ms) };
             if rc < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::Interrupted {
@@ -312,8 +322,12 @@ impl X11 {
                     "poll on X connection failed: {err}"
                 )));
             }
-            if pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            if pfds[0].revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
                 return Err(X11Error::Protocol("X connection fd error".into()));
+            }
+            if pfds[1..].iter().any(|p| p.revents != 0) {
+                // An event that arrived at the same moment is picked up by the next call.
+                return Ok(None);
             }
             // Readable (or HUP) or timed out: loop; poll_for_event reads the socket and
             // reports a broken connection as an error.

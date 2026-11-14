@@ -8,6 +8,7 @@
 //! only sees `DisplayEvent`s and calls `Backend` methods.
 
 use std::error::Error;
+use std::os::fd::RawFd;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::compat::protocol::{Command, Status};
@@ -65,9 +66,15 @@ pub enum DisplayEvent {
 pub trait Backend {
     fn capabilities(&self) -> Capabilities;
 
-    /// Wait up to `timeout` for (`Some`) or poll (`None`) one event. `Err` means the event
-    /// could not be read; whether that is fatal is decided with `check_connection`.
-    fn wait_event(&mut self, timeout: Option<Duration>) -> BackendResult<Option<DisplayEvent>>;
+    /// Wait up to `timeout` for (`Some`) or poll (`None`) one event. A wait also ends
+    /// early, with `Ok(None)`, as soon as one of the `wake` descriptors is readable (the
+    /// daemon's other input, such as the control socket). `Err` means the event could not
+    /// be read; whether that is fatal is decided with `check_connection`.
+    fn wait_event(
+        &mut self,
+        timeout: Option<Duration>,
+        wake: &[RawFd],
+    ) -> BackendResult<Option<DisplayEvent>>;
     /// Called once after each batch of events (deferred work such as keymap reloads).
     fn end_of_batch(&mut self);
     /// Round trip to the display server; `Err` when the connection is gone.

@@ -57,6 +57,11 @@ wait_for() {
 }
 
 ours() { DISPLAY="$DPY" "$OURCMD" "$@"; }
+# The same client over the daemon's control socket instead of the X protocol.
+sock() { DISPLAY="$DPY" "$OURCMD" -socket "$@"; }
+# The daemon puts its control socket here (a private directory, as it insists on).
+export XDG_RUNTIME_DIR="$TMP/run"
+mkdir -m 700 "$XDG_RUNTIME_DIR"
 real() { "$REALCMD" -display "$DPY" "$@"; }
 status_time() { ours -time 2>&1; }
 is_blanked() { status_time | grep -q "screen blanked since"; }
@@ -124,6 +129,13 @@ if [ "$v_ours" = "XScreenSaver 6.15" ] && [ "$v_real" = "XScreenSaver 6.15" ]; t
     pass "(a) -version: ours='$v_ours' real='$v_real'"
 else
     fail "(a) -version: ours='$v_ours' real='$v_real'"
+fi
+v_sock="$(sock -version 2>&1)"
+t_sock="$(sock -time 2>&1)"
+if [ "$v_sock" = "$v_real" ] && [ "$t_sock" = "$(real -time 2>&1)" ]; then
+    pass "(a) control socket: -version and -time match the X protocol ('$t_sock')"
+else
+    fail "(a) control socket: version='$v_sock' time='$t_sock'"
 fi
 # A second daemon must refuse to start.
 if HOME="$TMP/home" DISPLAY="$DPY" "$DAEMON" --no-splash >"$TMP/second.log" 2>&1; then
@@ -211,7 +223,21 @@ if [ "$rc" -ne 0 ] && echo "$out" | grep -q "screen is locked"; then
 else
     fail "(e) -restart while locked: rc=$rc out=$out"
 fi
+for c in -exit -restart -suspend; do
+    out="$(sock $c 2>&1)"; rc=$?
+    if [ "$rc" -ne 0 ] && echo "$out" | grep -q "screen is locked" && is_locked; then
+        pass "(e) control socket: $c refused while locked (rc=$rc)"
+    else
+        fail "(e) control socket: $c while locked: rc=$rc out=$out"
+    fi
+done
+if sock -time 2>&1 | grep -q "screen locked since"; then
+    pass "(e) control socket: -time reports the lock"
+else
+    fail "(e) control socket: -time: $(sock -time 2>&1)"
+fi
 real -deactivate >/dev/null 2>&1
+sock -deactivate >/dev/null 2>&1
 if is_locked; then
     pass "(e) -deactivate keeps the lock"
 else
@@ -243,6 +269,12 @@ if [ "$rc" -eq 0 ] && wait_for 5 "real -version" && kill -0 "$DAEMON_PID" 2>/dev
 else
     fail "(f) -restart: rc=$rc out=$out"
 fi
+out="$(sock -activate 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && is_blanked && sock -deactivate >/dev/null 2>&1 && wait_for 1 is_unblanked; then
+    pass "(f) control socket: -activate blanks and -deactivate unblanks"
+else
+    fail "(f) control socket: -activate: rc=$rc out=$out $(status_time)"
+fi
 out="$(real -exit 2>&1)"; rc=$?
 gone=0
 for _ in $(seq 1 30); do
@@ -254,6 +286,11 @@ if [ "$rc" -eq 0 ] && [ "$gone" -eq 1 ]; then
     DAEMON_PID=""
     if [ "$drc" -eq 0 ]; then
         pass "(f) -exit: daemon exited with status 0"
+        if ls "$XDG_RUNTIME_DIR" | grep -q .; then
+            fail "(f) control socket left behind: $(ls "$XDG_RUNTIME_DIR")"
+        else
+            pass "(f) control socket removed at exit"
+        fi
     else
         fail "(f) -exit: daemon exit status $drc"
     fi
