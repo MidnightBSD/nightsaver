@@ -7,16 +7,6 @@ pub mod monitors;
 pub mod present;
 pub mod saver_window;
 
-/// Geometry of one monitor in root-window coordinates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Monitor {
-    pub x: i16,
-    pub y: i16,
-    pub width: u16,
-    pub height: u16,
-    pub primary: bool,
-}
-
 #[derive(Debug)]
 pub enum X11Error {
     Connect(String),

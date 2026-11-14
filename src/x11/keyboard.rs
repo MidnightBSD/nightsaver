@@ -1,5 +1,7 @@
 //! xkbcommon keymap/state for translating KeyPress during the lock dialog. Owner: Opus E.
 //!
+//! `KeyInput` and `classify` live in `crate::input` (shared with other display backends).
+//!
 //! Contract: `Keyboard::new(&X11)`, `.handle_event(&Event) -> bool` (alias `handle_xkb_event`),
 //! `.translate(&KeyPressEvent) -> KeyInput`, `is_xkb_event(&Event)`.
 //!
@@ -15,17 +17,7 @@ use xkbcommon::xkb as xk;
 
 use super::X11Error;
 use super::conn::X11;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KeyInput {
-    Text(String),
-    Backspace,
-    Enter,
-    Escape,
-    /// Clear whole buffer (Ctrl-U).
-    Kill,
-    Other,
-}
+use crate::input::{KeyInput, classify};
 
 /// Is this an XKB extension event (the kind `Keyboard::handle_event` consumes)?
 pub fn is_xkb_event(ev: &Event) -> bool {
@@ -44,29 +36,6 @@ pub fn is_xkb_event(ev: &Event) -> bool {
             | Event::XkbNewKeyboardNotify(_)
             | Event::XkbStateNotify(_)
     )
-}
-
-/// Classify a key from its keysym, UTF-8 text and whether Control is held.
-/// Pure function so it is unit-testable without an X server.
-pub fn classify(sym: u32, utf8: &str, ctrl: bool) -> KeyInput {
-    use xk::keysyms as k;
-    match sym {
-        k::KEY_Return | k::KEY_KP_Enter => return KeyInput::Enter,
-        k::KEY_BackSpace if ctrl => return KeyInput::Kill,
-        k::KEY_BackSpace => return KeyInput::Backspace,
-        k::KEY_Escape => return KeyInput::Escape,
-        k::KEY_u | k::KEY_U if ctrl => return KeyInput::Kill,
-        _ => {}
-    }
-    if ctrl {
-        // Ctrl+<letter> yields a control character; never insert it as text.
-        return KeyInput::Other;
-    }
-    if !utf8.is_empty() && !utf8.chars().any(char::is_control) {
-        KeyInput::Text(utf8.to_string())
-    } else {
-        KeyInput::Other
-    }
 }
 
 pub struct Keyboard {
@@ -252,24 +221,6 @@ impl Keyboard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xk::keysyms as k;
-
-    #[test]
-    fn classify_keys() {
-        assert_eq!(classify(k::KEY_Return, "\r", false), KeyInput::Enter);
-        assert_eq!(classify(k::KEY_KP_Enter, "\r", false), KeyInput::Enter);
-        assert_eq!(classify(k::KEY_BackSpace, "\x08", false), KeyInput::Backspace);
-        assert_eq!(classify(k::KEY_BackSpace, "", true), KeyInput::Kill);
-        assert_eq!(classify(k::KEY_Escape, "\x1b", false), KeyInput::Escape);
-        assert_eq!(classify(k::KEY_u, "", true), KeyInput::Kill);
-        assert_eq!(classify(k::KEY_U, "", true), KeyInput::Kill);
-        assert_eq!(classify(k::KEY_a, "", true), KeyInput::Other);
-        assert_eq!(classify(k::KEY_a, "a", false), KeyInput::Text("a".into()));
-        assert_eq!(classify(k::KEY_A, "A", false), KeyInput::Text("A".into()));
-        assert_eq!(classify(0x00e9, "é", false), KeyInput::Text("é".into()));
-        assert_eq!(classify(0xffe1, "", false), KeyInput::Other); // Shift_L
-        assert_eq!(classify(0xff09, "\t", false), KeyInput::Other); // Tab
-    }
 
     /// Live check against an X server (e.g. `Xvfb :99`): keymap loads and a Shift press
     /// produces an XkbStateNotify. Runs only with NIGHTSAVER_XKB_TEST=1 and DISPLAY set.

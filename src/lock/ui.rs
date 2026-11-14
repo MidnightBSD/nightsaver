@@ -137,7 +137,7 @@ fn status_line(locker: &Locker) -> (&str, u32) {
 mod tests {
     use super::*;
     use crate::lock::{AuthFn, Locker};
-    use crate::x11::keyboard::KeyInput;
+    use crate::input::KeyInput;
     use std::sync::Arc;
     use std::time::Duration;
 

@@ -23,6 +23,7 @@ src/bin/nightsaver-auth.rs     PAM helper process (one per unlock attempt; see s
 src/cli.rs                     xscreensaver-compatible flag parsing
 src/config/                    merged Config: CLI > ~/.config/nightsaver/config.toml > ~/.xscreensaver > defaults
 src/compat/protocol.rs         SCREENSAVER ClientMessage + _SCREENSAVER_* root/window properties
+src/display/ src/input.rs      display-independent types: Monitor + sanitize, KeyInput + classify
 src/x11/                       x11rb XCBConnection, monitors, saver windows, idle, grabs, present, keyboard
 src/render/                    Framebuffer (0x00RRGGBB), bitmap font, OLED post-pass
 src/patterns/                  trait Pattern + blank/clock/starfield/matrix/midnight/cat/juggler/puppy/penguin (+ assets/)
@@ -37,7 +38,8 @@ etc/ man/ tests/ Makefile      packaging, man pages, Xvfb smoke test
    keys, or test results. If something is unverified, say so.
 2. **Stay inside the files you own.** Shared contracts live in the module `mod.rs` files and
    `src/config/mod.rs`, `src/patterns/mod.rs`, `src/render/mod.rs`, `src/compat/protocol.rs`,
-   `src/lock/mod.rs`, `src/lock/pam.rs`, `src/x11/mod.rs`, `src/x11/keyboard.rs`. Changing a
+   `src/lock/mod.rs`, `src/lock/pam.rs`, `src/x11/mod.rs`, `src/x11/keyboard.rs`,
+   `src/display/mod.rs`, `src/input.rs`. Changing a
    shared contract requires updating every user in the same change and saying so in your report.
 3. **Lock-screen security invariants** (non-negotiable):
    - Never unmap, lower, or exit while `SaverState::Locked` except after a successful PAM result.

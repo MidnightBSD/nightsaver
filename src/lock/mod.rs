@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::x11::keyboard::KeyInput;
+use crate::input::KeyInput;
 use pam::PamError;
 
 /// Maximum password length in bytes.
