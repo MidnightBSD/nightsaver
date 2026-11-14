@@ -11,7 +11,7 @@
 //! The framebuffer is drawn at (0,0) of `window`; only the overlap of the framebuffer and the
 //! presenter's image size is copied, the rest of the image stays black.
 
-use x11rb::connection::Connection;
+use x11rb::connection::{Connection, RequestConnection};
 use x11rb::image::{BitsPerPixel, Image, ImageOrder};
 use x11rb::protocol::xproto::{ConnectionExt as _, CreateGCAux, Gcontext, Window};
 
@@ -95,6 +95,15 @@ impl std::fmt::Debug for Presenter {
     }
 }
 
+/// Size of the PutImage request header x11rb puts in front of the pixel data.
+const PUT_IMAGE_HEADER: usize = 24;
+
+/// True if a PutImage request of at most `max_request_bytes` can carry at least one image
+/// line of `stride` bytes, i.e. `Image::put` can make progress.
+fn fits_put_image(max_request_bytes: usize, stride: usize) -> bool {
+    max_request_bytes.checked_sub(PUT_IMAGE_HEADER).is_some_and(|room| room >= stride.max(1))
+}
+
 fn alloc_image(x: &X11, width: u32, height: u32) -> Result<Image<'static>, X11Error> {
     let w = u16::try_from(width.max(1))
         .map_err(|_| X11Error::Protocol(format!("image width {width} too large")))?;
@@ -140,6 +149,16 @@ impl Presenter {
 
     /// Convert `fb` into the image and upload it to `window` at (0,0), then flush.
     pub fn present(&mut self, x: &X11, window: Window, fb: &Framebuffer) -> Result<(), X11Error> {
+        // `Image::put` computes `maximum_request_bytes - 24` and divides by the lines that
+        // fit, both unchecked. A dead connection reports a maximum of 0, which panics there
+        // (arithmetic overflow) instead of returning an error; report it as one ourselves.
+        let stride = self.image.data().len() / usize::from(self.image.height()).max(1);
+        let max = x.conn.maximum_request_bytes();
+        if !fits_put_image(max, stride) {
+            return Err(X11Error::Protocol(format!(
+                "cannot upload a frame: the server accepts requests of {max} bytes (connection lost?)"
+            )));
+        }
         self.convert(fb);
         self.image.put(&x.conn, window, self.gc, 0, 0)?;
         x.flush();
@@ -203,6 +222,17 @@ impl Presenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn put_image_needs_room_for_one_line() {
+        // A dead connection reports 0: must be refused, not subtracted from.
+        assert!(!fits_put_image(0, 5120));
+        assert!(!fits_put_image(PUT_IMAGE_HEADER, 5120));
+        assert!(!fits_put_image(PUT_IMAGE_HEADER + 5119, 5120), "less than one line");
+        assert!(fits_put_image(PUT_IMAGE_HEADER + 5120, 5120));
+        assert!(fits_put_image(262_140, 5120), "the usual core-protocol maximum");
+        assert!(!fits_put_image(PUT_IMAGE_HEADER, 0), "an empty line still needs a byte");
+    }
 
     #[test]
     fn chan_scaling() {
